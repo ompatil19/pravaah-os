@@ -1,0 +1,62 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# SQLite (local dev fallback)
+*.db
+*.db-shm
+*.db-wal
+
+# Uploads (user files — do not commit)
+uploads/
+
+# ChromaDB (vector store — do not commit)
+chroma_store/
+chroma_db/
+
+# Frontend build
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Logs
+*.log
+flask.log
+rq-worker.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# VSCode / JetBrains
+.vscode/
+.idea/
+*.iml
+
+# Temporary
+*.tmp
+*.swp
+*.swo
