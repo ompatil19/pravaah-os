@@ -290,6 +290,8 @@ cd frontend && npm run dev
 | Health check | http://localhost:5000/health |
 | Job dashboard | http://localhost:5000/admin/rq |
 
+> Vite proxies `/api` and `/socket.io` requests to Flask on port 5000, so the frontend talks to the backend without any CORS issues in dev.
+
 ---
 
 ## API Reference
