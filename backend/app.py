@@ -21,7 +21,6 @@ structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
-        structlog.stdlib.add_logger_name,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.dev.ConsoleRenderer() if os.environ.get("FLASK_ENV") == "development"
         else structlog.processors.JSONRenderer(),
@@ -127,17 +126,18 @@ def create_app() -> Flask:
     # ---- Rate Limiter -------------------------------------------------------
     limiter.init_app(app)
 
-    # ---- SocketIO (gevent mode with Redis message queue if available) -------
+    # ---- SocketIO (threading mode — no eventlet/gevent monkey-patching needed)
+    # message_queue is only required for multi-process deployments; using it
+    # with eventlet requires monkey_patch() before all imports which is not
+    # compatible with our single-process setup. Redis pub/sub for doc progress
+    # is handled separately via _start_doc_progress_listener().
     socketio_kwargs: dict = {
         "cors_allowed_origins": CORS_ORIGINS,
+        "async_mode": "threading",
+        "allow_upgrades": False,  # werkzeug dev server can't handle WS upgrade → write() before start_response
         "logger": False,
         "engineio_logger": False,
     }
-    if redis_client:
-        socketio_kwargs["async_mode"] = "gevent"
-        socketio_kwargs["message_queue"] = REDIS_URL
-    else:
-        socketio_kwargs["async_mode"] = "threading"
 
     socketio.init_app(app, **socketio_kwargs)
 
@@ -159,27 +159,6 @@ def create_app() -> Flask:
     app.register_blueprint(auth_bp)
     app.register_blueprint(jobs_bp)
 
-    # ---- rq-dashboard at /admin/rq (protected by ADMIN_TOKEN) -------------
-    if redis_client:
-        try:
-            import rq_dashboard
-            app.config.from_object(rq_dashboard.default_settings)
-            app.config["RQ_DASHBOARD_REDIS_URL"] = REDIS_URL
-
-            @app.before_request
-            def _protect_rq_dashboard():
-                if request.path.startswith("/admin/rq"):
-                    token = request.headers.get("X-Admin-Token", "")
-                    if ADMIN_TOKEN and token != ADMIN_TOKEN:
-                        return jsonify(
-                            {"status": "error", "code": "FORBIDDEN",
-                             "message": "Admin token required."}
-                        ), 403
-
-            app.register_blueprint(rq_dashboard.blueprint, url_prefix="/admin/rq")
-            logger.info("rq-dashboard registered at /admin/rq")
-        except ImportError:
-            logger.warning("rq-dashboard not installed; /admin/rq unavailable.")
 
     # ---- Request logging middleware ----------------------------------------
     @app.before_request
@@ -217,8 +196,11 @@ def create_app() -> Flask:
             pass
         return jsonify({
             "status": "ok",
-            "version": "2.0.0",
-            "redis": redis_ok,
+            "data": {
+                "status": "ok",
+                "version": "2.0.0",
+                "redis": redis_ok,
+            },
         })
 
     # ---- Socket.IO handlers ------------------------------------------------

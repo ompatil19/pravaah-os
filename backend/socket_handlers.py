@@ -18,6 +18,7 @@ Emits:
 import base64
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timezone
 
@@ -31,6 +32,29 @@ logger = logging.getLogger(__name__)
 _socketio: SocketIO | None = None
 _session_manager = None  # pipeline.SessionManager
 
+# Per-session conversation history for LLM back-and-forth
+# { session_id: [{"role": "user"|"assistant", "content": str}, ...] }
+_conversation_histories: dict = {}
+_conv_lock = threading.Lock()
+
+# Per-session TTS generation counter — bumped each time user speaks.
+# LLM threads capture their generation at start; skip TTS if superseded.
+_tts_generation: dict = {}
+_gen_lock = threading.Lock()
+
+# Per-session semaphore — at most 2 concurrent realtime-LLM threads per session.
+# Prevents pile-up during bursty speech.
+_llm_semaphores: dict = {}
+_sem_lock = threading.Lock()
+_MAX_CONCURRENT_LLM = 2
+
+
+def _get_llm_semaphore(session_id: str) -> threading.Semaphore:
+    with _sem_lock:
+        if session_id not in _llm_semaphores:
+            _llm_semaphores[session_id] = threading.Semaphore(_MAX_CONCURRENT_LLM)
+        return _llm_semaphores[session_id]
+
 
 def init_handlers(socketio: SocketIO) -> None:
     """Register all Socket.IO event handlers. Called once from app.py."""
@@ -39,6 +63,12 @@ def init_handlers(socketio: SocketIO) -> None:
     _init_session_manager()
     _register_events(socketio)
     logger.info("Socket.IO handlers registered.")
+
+
+def close_session(session_id: str) -> None:
+    """Close the pipeline session for a call. Safe to call if session doesn't exist."""
+    if _session_manager:
+        _session_manager.close_session(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -50,11 +80,11 @@ def _init_session_manager():
     global _session_manager
     try:
         from pipeline.session_manager import SessionManager
-        api_key = os.environ.get("DEEPGRAM_API_KEY", "")
         _session_manager = SessionManager(
-            api_key=api_key,
-            on_transcript=_on_transcript,
-            on_error=_on_pipeline_error,
+            deepgram_api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
+            openrouter_api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+            on_interim_cb=lambda sid, t: _on_transcript(sid, t, is_final=False),
+            on_final_cb=lambda sid, t: _on_transcript(sid, t, is_final=True),
         )
         logger.info("SessionManager initialised.")
     except Exception as exc:
@@ -95,13 +125,28 @@ def _on_transcript(session_id: str, text: str, is_final: bool) -> None:
         room=session_id,
     )
 
-    # Trigger non-blocking LLM ack + TTS
+    # Bump generation — any in-flight LLM thread will abort its TTS output
+    with _gen_lock:
+        _tts_generation[session_id] = _tts_generation.get(session_id, 0) + 1
+        my_gen = _tts_generation[session_id]
+
+    # Trigger non-blocking LLM reply + TTS
     threading.Thread(
         target=_run_realtime_llm,
-        args=(session_id, text),
+        args=(session_id, text, my_gen),
         daemon=True,
         name=f"llm-rt-{session_id}",
     ).start()
+
+    # Trigger live summary every 5 final transcript segments
+    transcript_count = db.count_transcripts(session_id)
+    if transcript_count > 0 and transcript_count % 5 == 0:
+        threading.Thread(
+            target=_run_live_summary,
+            args=(session_id,),
+            daemon=True,
+            name=f"live-summary-{session_id}",
+        ).start()
 
 
 def _on_pipeline_error(session_id: str, code: str, message: str) -> None:
@@ -115,42 +160,130 @@ def _on_pipeline_error(session_id: str, code: str, message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Response cleaner — strip model chain-of-thought if it leaked into reply
+# ---------------------------------------------------------------------------
+
+_THINKING_PREFIXES = (
+    "okay,", "ok,", "okay.", "ok.", "alright,", "alright.",
+    "let me ", "let's ", "i need to ", "i should ", "i think ",
+    "the user ", "they are ", "they said ", "they asked ",
+    "hmm,", "hmm.", "well,", "so,", "so the ",
+)
+
+def _strip_thinking(text: str) -> str:
+    """
+    If the model output its chain-of-thought before the actual answer,
+    extract only the final answer sentence(s).
+    Works by detecting a thinking-style opening and returning the last
+    1-2 sentences, which are typically the actual reply.
+    """
+    stripped = text.strip()
+    first_20 = stripped[:20].lower()
+    if not any(first_20.startswith(p) for p in _THINKING_PREFIXES):
+        return stripped  # Looks clean already
+
+    # Split on double newlines first (sometimes model uses paragraph break)
+    paragraphs = [p.strip() for p in re.split(r'\n\n+', stripped) if p.strip()]
+    if len(paragraphs) > 1:
+        return paragraphs[-1]
+
+    # Single blob: split into sentences, return last 1-2
+    sentences = re.split(r'(?<=[.!?])\s+', stripped)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if len(sentences) > 2:
+        return ' '.join(sentences[-2:])
+    if len(sentences) == 2:
+        return sentences[-1]
+    return stripped
+
+
+# ---------------------------------------------------------------------------
 # LLM pipeline helpers
 # ---------------------------------------------------------------------------
 
-def _run_realtime_llm(session_id: str, latest_transcript: str) -> None:
+def _run_realtime_llm(session_id: str, latest_transcript: str, my_gen: int) -> None:
     """
-    After a final transcript: generate a short TTS acknowledgement and
-    emit it as audio. Runs in a background thread.
+    After a final transcript: send user message to LLM with conversation
+    history, speak the response via TTS, and emit audio back to the browser.
+    Runs in a background thread.
+
+    my_gen: the generation counter captured when this thread was spawned.
+    If the user speaks again before TTS is ready, the counter increments and
+    this thread drops the audio silently (interruption detected).
     """
+    sem = _get_llm_semaphore(session_id)
+    if not sem.acquire(blocking=False):
+        logger.debug("[%s] LLM semaphore full — dropping realtime request", session_id)
+        return
     try:
         api_key = os.environ.get("OPENROUTER_API_KEY", "")
         dg_key = os.environ.get("DEEPGRAM_API_KEY", "")
         if not api_key or not dg_key:
+            logger.warning("[%s] Missing API keys — skipping LLM/TTS", session_id)
             return
 
         from pipeline.openrouter_client import OpenRouterLLMClient
         from pipeline.deepgram_tts import DeepgramTTSClient
+        from pipeline.prompt_templates import SYSTEM_CONVERSATION
 
+        # ── Build conversation history ──────────────────────────────────────
+        with _conv_lock:
+            if session_id not in _conversation_histories:
+                _conversation_histories[session_id] = []
+            history = _conversation_histories[session_id]
+            history.append({"role": "user", "content": latest_transcript})
+            # Keep last 10 turns (5 user + 5 assistant) to avoid token bloat
+            if len(history) > 20:
+                history[:] = history[-20:]
+            messages_snapshot = list(history)
+
+        # ── LLM call with full conversation context ─────────────────────────
+        # Default to claude-3-haiku (non-thinking) — haiku-4-5 outputs chain-of-thought
         llm = OpenRouterLLMClient(api_key=api_key)
-        ack_text = llm.detect_language(latest_transcript)  # light model call
-        # Generate acknowledgement
-        from pipeline.prompt_templates import SYSTEM_ACK
-        ack_text = llm._call(
-            [
-                {"role": "system", "content": SYSTEM_ACK},
-                {"role": "user", "content": f"Customer said: {latest_transcript}\nAcknowledge briefly."},
-            ],
-            model=os.environ.get("OPENROUTER_LIGHT_MODEL", "anthropic/claude-haiku-4-5-20251001"),
-            temperature=0.5,
-            max_tokens=60,
+        raw_reply = llm._call(
+            [{"role": "system", "content": SYSTEM_CONVERSATION}] + messages_snapshot,
+            model=os.environ.get("OPENROUTER_LIGHT_MODEL", "anthropic/claude-3-haiku"),
+            temperature=0.7,
+            max_tokens=120,
         )
         llm.close()
+        reply = _strip_thinking(raw_reply)
 
-        # TTS
+        # Store assistant reply in history
+        with _conv_lock:
+            if session_id in _conversation_histories:
+                _conversation_histories[session_id].append(
+                    {"role": "assistant", "content": reply}
+                )
+
+        logger.info("[%s] LLM reply: %r", session_id, reply[:100])
+
+        # Check if user interrupted before we send TTS
+        with _gen_lock:
+            current_gen = _tts_generation.get(session_id, 0)
+        if current_gen != my_gen:
+            logger.info("[%s] TTS skipped — user interrupted (gen %d → %d)", session_id, my_gen, current_gen)
+            return
+
+        # Emit text reply to frontend (shows in UI)
+        if _socketio:
+            _socketio.emit(
+                "ai_reply",
+                {"session_id": session_id, "text": reply},
+                room=session_id,
+            )
+
+        # ── TTS synthesis ───────────────────────────────────────────────────
         tts = DeepgramTTSClient(api_key=dg_key)
-        audio_bytes = tts.synthesize(ack_text)
+        audio_bytes = tts.synthesize(reply)
         tts.close()
+
+        # Final check — user may have spoken during TTS synthesis
+        with _gen_lock:
+            current_gen = _tts_generation.get(session_id, 0)
+        if current_gen != my_gen:
+            logger.info("[%s] TTS audio dropped — interrupted during synthesis (gen %d → %d)", session_id, my_gen, current_gen)
+            return
 
         audio_b64 = base64.b64encode(audio_bytes).decode()
         if _socketio:
@@ -159,8 +292,51 @@ def _run_realtime_llm(session_id: str, latest_transcript: str) -> None:
                 {"session_id": session_id, "audio": audio_b64},
                 room=session_id,
             )
+
     except Exception as exc:
         logger.warning("[%s] Real-time LLM/TTS failed: %s", session_id, exc)
+    finally:
+        sem.release()
+
+
+def _run_live_summary(session_id: str) -> None:
+    """
+    Generate a partial summary from transcripts so far and emit it
+    to the browser during the call. Triggered every 5 final segments.
+    """
+    try:
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if not api_key:
+            return
+
+        transcript_rows = db.get_transcripts(session_id)
+        if not transcript_rows:
+            return
+
+        full_text = " ".join(r.text for r in transcript_rows if r.is_final)
+        if not full_text.strip():
+            return
+
+        from pipeline.openrouter_client import OpenRouterLLMClient
+        client = OpenRouterLLMClient(api_key=api_key)
+        summary_text = client.summarize_transcript(full_text)
+        client.close()
+
+        # Persist latest summary (upsert)
+        generated_at = datetime.now(timezone.utc).isoformat()
+        model_used = os.environ.get("OPENROUTER_HEAVY_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+        db.insert_summary(session_id, summary_text, model_used, generated_at)
+
+        if _socketio:
+            _socketio.emit(
+                "call_summary",
+                {"session_id": session_id, "summary": summary_text},
+                room=session_id,
+            )
+        logger.info("[%s] Live summary updated (%d segments).", session_id, len(transcript_rows))
+
+    except Exception as exc:
+        logger.warning("[%s] Live summary failed: %s", session_id, exc)
 
 
 def _run_final_llm_pipeline(session_id: str) -> None:
@@ -173,7 +349,7 @@ def _run_final_llm_pipeline(session_id: str) -> None:
         if not transcript_rows:
             return
 
-        full_text = " ".join(r["text"] for r in transcript_rows if r["is_final"])
+        full_text = " ".join(r.text for r in transcript_rows if r.is_final)
         if not full_text.strip():
             return
 
@@ -253,10 +429,10 @@ def _register_events(socketio: SocketIO) -> None:
         logger.info("[%s] Client joined room.", session_id)
 
         if _session_manager:
-            call_row = db.get_call(session_id)
-            language = call_row["language"] if call_row else "hi-en"
-            ok = _session_manager.create_session(session_id, language)
-            if not ok:
+            try:
+                _session_manager.create_session(session_id)
+            except Exception as exc:
+                logger.error("[%s] STT connect failed: %s", session_id, exc)
                 emit("error", {
                     "session_id": session_id,
                     "code": "STT_CONNECT_FAILED",
@@ -293,7 +469,9 @@ def _register_events(socketio: SocketIO) -> None:
             return
 
         if _session_manager:
-            _session_manager.send_audio(session_id, audio_bytes)
+            session = _session_manager.get(session_id)
+            if session:
+                session.send_audio(audio_bytes)
 
     @socketio.on("leave_call")
     def handle_leave_call(payload):
@@ -304,6 +482,14 @@ def _register_events(socketio: SocketIO) -> None:
 
         leave_room(session_id)
         logger.info("[%s] Client left room.", session_id)
+
+        # Clear conversation history, generation counter, and LLM semaphore for this session
+        with _conv_lock:
+            _conversation_histories.pop(session_id, None)
+        with _gen_lock:
+            _tts_generation.pop(session_id, None)
+        with _sem_lock:
+            _llm_semaphores.pop(session_id, None)
 
         if _session_manager:
             _session_manager.close_session(session_id)

@@ -65,9 +65,7 @@ api.interceptors.response.use(
       }
 
       try {
-        const { data } = await api.post('/api/auth/refresh', {}, {
-          headers: { Authorization: `Bearer ${refreshToken}` },
-        });
+        const { data } = await api.post('/api/auth/refresh', { refresh_token: refreshToken });
         const newAccessToken = data.access_token;
         localStorage.setItem(STORAGE_KEYS.accessToken, newAccessToken);
         onTokenRefreshed(newAccessToken);
@@ -128,9 +126,7 @@ export default function useAuth() {
   const refreshToken = useCallback(async () => {
     const token = localStorage.getItem(STORAGE_KEYS.refreshToken);
     if (!token) return null;
-    const { data } = await api.post('/api/auth/refresh', {}, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const { data } = await api.post('/api/auth/refresh', { refresh_token: token });
     localStorage.setItem(STORAGE_KEYS.accessToken, data.access_token);
     return data.access_token;
   }, []);

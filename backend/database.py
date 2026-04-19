@@ -41,16 +41,20 @@ def _build_engine():
             conn.execute(text("PRAGMA foreign_keys=ON"))
             conn.execute(text("PRAGMA synchronous=NORMAL"))
     else:
-        # Supabase uses pgbouncer in transaction mode — prepared statements must
-        # be disabled (prepare_threshold=0) and SSL is required.
-        from sqlalchemy.pool import NullPool
+        # Supabase pgbouncer — keep a small persistent pool so we don't
+        # pay the SSL handshake cost (~6 s) on every request.
+        # psycopg2 doesn't use server-side prepared statements by default,
+        # so connection pooling is safe with pgbouncer in transaction mode.
         engine = create_engine(
             db_url,
-            poolclass=NullPool,
+            pool_size=5,
+            max_overflow=5,
+            pool_timeout=30,
             pool_pre_ping=True,
             connect_args={
                 "sslmode": "require",
                 "options": "-c statement_timeout=30000",
+                "connect_timeout": 10,
             },
         )
 
@@ -58,7 +62,7 @@ def _build_engine():
 
 
 engine = _build_engine()
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +109,7 @@ def insert_call(
     session_id: str,
     agent_id: str,
     language: str,
-    metadata: Optional[str],
+    call_metadata: Optional[str],
     created_at: str,
 ) -> int:
     from .models import Call
@@ -115,7 +119,7 @@ def insert_call(
             agent_id=agent_id,
             status="active",
             language=language,
-            metadata=metadata,
+            call_metadata=call_metadata,
             created_at=created_at,
         )
         session.add(call)
@@ -338,6 +342,16 @@ def update_document_status(
         session.query(Document).filter(Document.doc_id == doc_id).update(updates)
 
 
+def list_documents(page: int = 1, per_page: int = 50) -> tuple[list, int]:
+    from .models import Document
+    with get_db() as session:
+        q = session.query(Document).order_by(Document.uploaded_at.desc())
+        total = q.count()
+        offset = (page - 1) * per_page
+        rows = q.offset(offset).limit(per_page).all()
+        return rows, total
+
+
 def get_document(doc_id: str):
     from .models import Document
     with get_db() as session:
@@ -442,6 +456,12 @@ def get_user_by_id(user_id: int):
     from .models import User
     with get_db() as session:
         return session.query(User).filter(User.id == user_id).first()
+
+
+def list_users() -> list:
+    from .models import User
+    with get_db() as session:
+        return session.query(User).order_by(User.id.asc()).all()
 
 
 def create_user(

@@ -55,7 +55,7 @@ def route_model(task: str) -> str:
     """
     if task in HEAVY_TASKS:
         return os.getenv("OPENROUTER_HEAVY_MODEL", "anthropic/claude-sonnet-4-5")
-    return os.getenv("OPENROUTER_LIGHT_MODEL", "anthropic/claude-haiku-4-5-20251001")
+    return os.getenv("OPENROUTER_LIGHT_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
 
 
 class OpenRouterLLMClient:

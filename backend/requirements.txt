@@ -7,8 +7,7 @@ flask-cors==4.0.1
 flask-socketio==5.3.6
 
 # Async mode
-gevent==24.2.1
-gevent-websocket==0.10.1
+eventlet==0.38.2
 
 # WebSocket async support for SocketIO (fallback/threading mode)
 simple-websocket==1.0.0
@@ -39,7 +38,6 @@ redis==5.0.7
 
 # RQ job queue (v2)
 rq==1.16.2
-rq-dashboard==0.6.1
 
 # JWT authentication (v2)
 PyJWT==2.8.0
@@ -53,11 +51,14 @@ flask-limiter==3.7.0
 # Structured logging (v2)
 structlog==24.1.0
 
+# NumPy: pin < 2.0 — chromadb 0.5.x uses np.float_ which was removed in 2.0
+numpy<2.0
+
 # Vector store (v2)
 chromadb==0.5.0
 
 # Token counting (v2)
-tiktoken==0.7.0
+tiktoken==0.8.0
 
 # PostgreSQL driver (required for Supabase)
 psycopg2-binary==2.9.9

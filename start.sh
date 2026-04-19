@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pravaah OS v2 — One-command launcher
-# Starts Redis, RQ worker, Flask (port 5000), and Vite (port 3000) with clean teardown.
+# Starts Redis, RQ worker, Flask (port 8000), and Vite (port 5173) with clean teardown.
 # Works on macOS (zsh/bash) and Ubuntu (bash).
 
 set -euo pipefail
@@ -97,8 +97,8 @@ if [ ! -f .env ]; then
     echo -e "${YELLOW}╠══════════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${YELLOW}║  DEEPGRAM_API_KEY   → https://console.deepgram.com/              ║${NC}"
     echo -e "${YELLOW}║  OPENROUTER_API_KEY → https://openrouter.ai/keys                 ║${NC}"
-    echo -e "${YELLOW}║  FLASK_SECRET_KEY   → python -c "import secrets; print(secrets.token_hex(32))"  ║${NC}"
-    echo -e "${YELLOW}║  JWT_SECRET_KEY     → python -c "import secrets; print(secrets.token_hex(32))"  ║${NC}"
+    echo -e "${YELLOW}║  FLASK_SECRET_KEY   → python -c 'import secrets; print(secrets.token_hex(32))'  ║${NC}"
+    echo -e "${YELLOW}║  JWT_SECRET_KEY     → python -c 'import secrets; print(secrets.token_hex(32))'  ║${NC}"
     echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     read -r -p "Press Enter after setting the keys to continue, or Ctrl+C to abort..."
@@ -137,6 +137,26 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Kill any stale processes from a previous run
+# ─────────────────────────────────────────────────────────────────────────────
+FLASK_PORT="${FLASK_PORT:-8000}"
+VITE_PORT="${VITE_PORT:-5173}"
+
+_kill_port() {
+    local port="$1"
+    local pids
+    pids=$(lsof -ti:"$port" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+        echo "$pids" | xargs kill -9 2>/dev/null || true
+        info "Killed stale process(es) on port $port"
+    fi
+}
+
+info "Clearing stale processes on ports ${FLASK_PORT} and ${VITE_PORT}..."
+_kill_port "$FLASK_PORT"
+_kill_port "$VITE_PORT"
+
 # Process management — track PIDs for clean teardown
 # ─────────────────────────────────────────────────────────────────────────────
 FLASK_PID=""
@@ -192,15 +212,18 @@ fi
 # 8. Start RQ worker in background
 # ─────────────────────────────────────────────────────────────────────────────
 info "Starting RQ worker (queue: pravaah)..."
-PYTHONPATH="$SCRIPT_DIR" "$VENV_PYTHON" -m rq worker pravaah --with-scheduler \
+# OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES prevents a macOS fork() crash
+# that occurs when native extensions (e.g. ChromaDB/hnswlib) are loaded
+# in a thread before the work-horse process is forked.
+OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES PYTHONPATH="$SCRIPT_DIR" \
+    "$VENV/bin/rq" worker pravaah --with-scheduler \
     > "$RQ_LOG" 2>&1 &
 RQ_PID=$!
 success "RQ worker started (PID $RQ_PID) — log: rq-worker.log"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. Start Flask on port 5000 in background
+# 9. Start Flask in background
 # ─────────────────────────────────────────────────────────────────────────────
-FLASK_PORT="${FLASK_PORT:-5000}"
 FLASK_HOST="${FLASK_HOST:-0.0.0.0}"
 
 info "Starting Flask on http://localhost:${FLASK_PORT} ..."
@@ -209,12 +232,10 @@ PYTHONPATH="$SCRIPT_DIR" "$VENV_PYTHON" -m backend.app \
 FLASK_PID=$!
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10. Start Vite on port 3000 in background
+# 10. Start Vite (--strict-port so it fails if port is taken, not drifts)
 # ─────────────────────────────────────────────────────────────────────────────
-VITE_PORT="${VITE_PORT:-3000}"
-
 info "Starting Vite dev server on http://localhost:${VITE_PORT} ..."
-cd frontend && npm run dev -- --port "$VITE_PORT" > "$VITE_LOG" 2>&1 &
+cd frontend && npm run dev -- --port "$VITE_PORT" --strictPort > "$VITE_LOG" 2>&1 &
 VITE_PID=$!
 cd "$SCRIPT_DIR"
 
@@ -270,10 +291,9 @@ fi
 echo ""
 echo -e "${GREEN}${BOLD}┌──────────────────────────────────────┐${NC}"
 echo -e "${GREEN}${BOLD}│   PRAVAAH OS v2 — RUNNING            │${NC}"
-echo -e "${GREEN}${BOLD}│   App:     http://localhost:3000     │${NC}"
-echo -e "${GREEN}${BOLD}│   API:     http://localhost:5000     │${NC}"
-echo -e "${GREEN}${BOLD}│   Jobs:    http://localhost:5000/admin/rq  │${NC}"
-echo -e "${GREEN}${BOLD}│   Redis:   localhost:6379            │${NC}"
+echo -e "${GREEN}${BOLD}│   App:  http://localhost:${VITE_PORT}       │${NC}"
+echo -e "${GREEN}${BOLD}│   API:  http://localhost:${FLASK_PORT}       │${NC}"
+echo -e "${GREEN}${BOLD}│   Redis: localhost:6379              │${NC}"
 echo -e "${GREEN}${BOLD}└──────────────────────────────────────┘${NC}"
 echo ""
 echo -e "${CYAN}  Logs: flask.log | vite.log | rq-worker.log | redis.log${NC}"

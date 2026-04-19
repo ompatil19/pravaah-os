@@ -253,9 +253,13 @@ class RAGEngine:
         for name in collection_names:
             try:
                 collection = self._chroma.get_collection(name)
+                count = collection.count()
+                if count == 0:
+                    logger.debug("Collection %s is empty — skipping", name)
+                    continue
                 res = collection.query(
                     query_embeddings=[query_vector],
-                    n_results=min(top_k, collection.count()),
+                    n_results=min(top_k, count),
                     include=["documents", "metadatas", "distances"],
                 )
                 docs = res.get("documents", [[]])[0]

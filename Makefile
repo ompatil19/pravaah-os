@@ -2,7 +2,7 @@
 # Usage: make <target>
 # Uses tabs for recipe indentation (required by make).
 
-PYTHON := python3
+PYTHON := python3.12
 PIP    := $(PYTHON) -m pip
 NPM    := npm
 VENV   := .venv
@@ -10,7 +10,7 @@ VENV_PYTHON := $(VENV)/bin/python
 VENV_PIP    := $(VENV)/bin/pip
 
 
-.PHONY: setup dev worker test test-pipeline lint clean create-admin help
+.PHONY: setup dev worker test test-pipeline lint clean create-admin reset-admin help
 
 ##@ Help
 
@@ -63,7 +63,7 @@ worker: ## Start RQ worker only (queue: pravaah)
 		echo "ERROR: venv not found. Run 'make setup' first."; \
 		exit 1; \
 	fi
-	PYTHONPATH=. $(VENV_PYTHON) -m rq worker pravaah
+	PYTHONPATH=. $(VENV)/bin/rq worker pravaah --with-scheduler
 
 ##@ Testing
 
@@ -96,25 +96,16 @@ lint: ## Run flake8 on backend + pipeline Python code (max line length: 120)
 
 ##@ Admin
 
-create-admin: ## Create the first admin user (interactive)
+create-admin: ## Create the first admin user
 	@echo "==> Creating admin user..."
-	@if [ ! -d $(VENV) ]; then \
-		echo "ERROR: venv not found. Run 'make setup' first."; \
-		exit 1; \
-	fi
-	@if [ ! -f .env ]; then \
-		echo "ERROR: .env not found. Run 'make setup' first."; \
-		exit 1; \
-	fi
-	@echo ""
-	@echo "  To create an admin user, run the following command:"
-	@echo ""
-	@echo "    source .env && PYTHONPATH=. $(VENV_PYTHON) -c \\"
-	@echo "      \"from backend.database import create_user; from backend.auth import hash_password; import uuid; \\"
-	@echo "       uid = create_user(username='admin', password_hash=hash_password('changeme'), role='admin', api_key=str(uuid.uuid4())); \\"
-	@echo "       print(f'Admin user created with id={uid}. Change the password immediately.')\""
-	@echo ""
-	@echo "  Then update the password via POST /api/auth/login and the /api/auth/users endpoint."
+	@if [ ! -d $(VENV) ]; then echo "ERROR: venv not found. Run 'make setup' first."; exit 1; fi
+	@if [ ! -f .env ]; then echo "ERROR: .env not found. Run 'make setup' first."; exit 1; fi
+	@PYTHONPATH=. $(VENV_PYTHON) scripts/create_admin.py
+
+reset-admin: ## Reset the admin password interactively
+	@echo "==> Resetting admin password..."
+	@if [ ! -d $(VENV) ]; then echo "ERROR: venv not found. Run 'make setup' first."; exit 1; fi
+	@PYTHONPATH=. $(VENV_PYTHON) scripts/create_admin.py reset
 
 ##@ Cleanup
 

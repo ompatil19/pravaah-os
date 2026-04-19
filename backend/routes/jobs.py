@@ -61,7 +61,7 @@ def get_job(job_id: str):
 # GET /api/jobs/
 # ---------------------------------------------------------------------------
 
-@jobs_bp.route("/", methods=["GET"])
+@jobs_bp.route("", methods=["GET"])
 @require_auth(roles=["admin"])
 def list_jobs():
     """List recent jobs (admin only), paginated."""

@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 const api = axios.create({
   baseURL: API_URL,
@@ -18,7 +18,13 @@ api.interceptors.request.use(
 
 // ─── Response interceptor ───
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    // Unwrap { status: "ok", data: {...} } so callers get data directly
+    if (response.data?.status === 'ok') {
+      response.data = response.data.data;
+    }
+    return response;
+  },
   (error) => {
     const message =
       error.response?.data?.message ||
@@ -43,6 +49,7 @@ export const documentsApi = {
       headers: { 'Content-Type': 'multipart/form-data' },
     }),
   get: (docId) => api.get(`/api/documents/${docId}`),
+  list: (params) => api.get('/api/documents', { params }),
 };
 
 // ─── Analytics Endpoints ───

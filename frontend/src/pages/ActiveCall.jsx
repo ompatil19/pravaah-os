@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { callsApi } from '../api';
 import useAudioCapture from '../hooks/useAudioCapture';
@@ -17,28 +17,49 @@ export default function ActiveCall() {
   const [isEnding,  setIsEnding]  = useState(false);
   const [endError,  setEndError]  = useState(null);
 
+  // Track current TTS audio so we can stop it on interruption
+  const currentAudioRef = useRef(null);
+
+  const stopCurrentTts = useCallback(() => {
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current.src = '';
+      currentAudioRef.current = null;
+    }
+  }, []);
+
   const {
-    transcripts, summary, actionItems,
-    isConnected, error: socketError, sendAudioChunk,
+    transcripts, aiReplies, summary, actionItems,
+    isConnected, error: socketError, sendAudioChunk, disconnectSocket,
   } = useCallSocket(sessionId);
 
   const onData = useCallback((blob) => sendAudioChunk(blob), [sendAudioChunk]);
   const { start, stop, isRecording, analyserNode, error: micError } = useAudioCapture(onData);
 
-  // TTS audio playback
+  // Stop TTS when user starts speaking
+  useEffect(() => {
+    if (isRecording) stopCurrentTts();
+  }, [isRecording, stopCurrentTts]);
+
+  // TTS audio playback — stop any previous audio before playing new
   useEffect(() => {
     const handleTts = ({ session_id, audio }) => {
       if (session_id !== sessionId) return;
+      stopCurrentTts();
       const bytes = Uint8Array.from(atob(audio), (c) => c.charCodeAt(0));
       const blob  = new Blob([bytes], { type: 'audio/mpeg' });
       const url   = URL.createObjectURL(blob);
       const el    = new Audio(url);
+      currentAudioRef.current = el;
       el.play().catch(() => {});
-      el.onended = () => URL.revokeObjectURL(url);
+      el.onended = () => {
+        URL.revokeObjectURL(url);
+        if (currentAudioRef.current === el) currentAudioRef.current = null;
+      };
     };
     socket.on('tts_audio', handleTts);
     return () => socket.off('tts_audio', handleTts);
-  }, [sessionId]);
+  }, [sessionId, stopCurrentTts]);
 
   const handleEndCall = async () => {
     stop();
@@ -46,6 +67,7 @@ export default function ActiveCall() {
     setEndError(null);
     try {
       await callsApi.end(sessionId, {});
+      disconnectSocket();
       navigate(`/call/${sessionId}/detail`);
     } catch (err) {
       setEndError(err.message);
@@ -56,6 +78,7 @@ export default function ActiveCall() {
   const handleEscalate = async () => {
     stop();
     try { await callsApi.end(sessionId, { escalated: true }); } catch (_) {}
+    disconnectSocket();
     navigate(`/call/${sessionId}/detail`);
   };
 
@@ -248,6 +271,60 @@ export default function ActiveCall() {
           overflowY: 'auto',
           minWidth: 0,
         }}>
+          {/* AI Replies panel */}
+          <div className="card-glass" style={{ flexShrink: 0 }}>
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: '0.6rem',
+              padding: '0.75rem 1rem',
+              borderBottom: '1px solid var(--border)',
+            }}>
+              <div style={{
+                width: '24px', height: '24px', borderRadius: '6px',
+                background: 'rgba(0,200,255,0.12)',
+                border: '1px solid rgba(0,200,255,0.2)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}>
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                  <path d="M6 1a5 5 0 100 10A5 5 0 006 1z" stroke="var(--cyan)" strokeWidth="1.2"/>
+                  <path d="M4 5h4M4 7h2.5" stroke="var(--cyan)" strokeWidth="1.1" strokeLinecap="round"/>
+                </svg>
+              </div>
+              <span style={{ fontFamily: 'var(--font-display)', fontWeight: 600, fontSize: '0.82rem', color: 'var(--text)' }}>
+                AI Replies
+              </span>
+              <span style={{
+                marginLeft: 'auto',
+                fontFamily: 'var(--font-mono)', fontSize: '0.6rem',
+                color: 'var(--cyan)', letterSpacing: '0.08em',
+              }}>
+                {aiReplies.length} msg{aiReplies.length !== 1 ? 's' : ''}
+              </span>
+            </div>
+            <div style={{ padding: '0.75rem', maxHeight: '180px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              {aiReplies.length === 0 ? (
+                <p style={{ fontFamily: 'var(--font-display)', fontSize: '0.78rem', color: 'var(--muted)', textAlign: 'center', padding: '0.5rem 0' }}>
+                  AI replies appear here after you speak.
+                </p>
+              ) : (
+                aiReplies.map((r) => (
+                  <div key={r.id} style={{
+                    padding: '0.5rem 0.75rem',
+                    background: 'rgba(0,200,255,0.06)',
+                    border: '1px solid rgba(0,200,255,0.15)',
+                    borderRadius: '8px',
+                  }}>
+                    <p style={{ fontFamily: 'var(--font-display)', fontSize: '0.82rem', color: 'var(--text)', lineHeight: 1.5 }}>
+                      {r.text}
+                    </p>
+                    <p style={{ fontFamily: 'var(--font-mono)', fontSize: '0.58rem', color: 'var(--muted)', marginTop: '4px' }}>
+                      {new Date(r.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                    </p>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
           <LiveSummaryPanel summary={summary} />
           <ActionItemsList items={actionItems} />
           <DocumentUploader sessionId={sessionId} />

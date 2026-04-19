@@ -98,6 +98,9 @@ class CallSession:
     def close(self) -> None:
         """Mark the session as inactive and schedule STT client shutdown."""
         self.is_active = False
+        # Set _closing synchronously so reconnect is suppressed even if Deepgram
+        # fires a 1011 timeout before the async close() coroutine runs.
+        self.stt_client.mark_closing()
         asyncio.run_coroutine_threadsafe(
             self.stt_client.close(), self._loop
         )
@@ -198,17 +201,22 @@ class SessionManager:
         with self._lock:
             self._sessions[session_id] = session
 
-        # Connect STT WebSocket (non-blocking from caller's perspective)
-        future = asyncio.run_coroutine_threadsafe(stt_client.connect(), self._loop)
-        try:
-            future.result(timeout=35)  # Wait up to 35s for connection
-        except Exception as exc:
-            logger.error("Failed to open Deepgram STT for session %s: %s", session_id, exc)
-            with self._lock:
-                self._sessions.pop(session_id, None)
-            raise
+        # Start STT connection in background — do NOT block the caller (Socket.IO handler).
+        # Audio chunks arriving before the connection is ready are buffered inside
+        # DeepgramSTTClient._pre_connect_buffer and flushed on first successful connect.
+        def _on_connect_done(fut):
+            try:
+                fut.result()
+                logger.info("Session created and STT connected: %s", session_id)
+            except Exception as exc:
+                logger.error("Failed to open Deepgram STT for session %s: %s", session_id, exc)
+                with self._lock:
+                    self._sessions.pop(session_id, None)
 
-        logger.info("Session created and STT connected: %s", session_id)
+        future = asyncio.run_coroutine_threadsafe(stt_client.connect(), self._loop)
+        future.add_done_callback(_on_connect_done)
+
+        logger.info("Session created, STT connecting in background: %s", session_id)
         return session
 
     def get(self, session_id: str) -> Optional[CallSession]:

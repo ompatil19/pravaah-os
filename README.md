@@ -286,11 +286,11 @@ cd frontend && npm run dev
 | Service | URL |
 |---|---|
 | Frontend | http://localhost:5173 |
-| Backend API | http://localhost:5000 |
-| Health check | http://localhost:5000/health |
-| Job dashboard | http://localhost:5000/admin/rq |
+| Backend API | http://localhost:8000 |
+| Health check | http://localhost:8000/health |
+| Job dashboard | http://localhost:8000/admin/rq |
 
-> Vite proxies `/api` and `/socket.io` requests to Flask on port 5000, so the frontend talks to the backend without any CORS issues in dev.
+> Vite proxies `/api` and `/socket.io` requests to Flask on port 8000, so the frontend talks to the backend without any CORS issues in dev.
 
 ---
 
@@ -456,7 +456,7 @@ All tests use an isolated temporary SQLite database and mock all external HTTP/W
 ## Troubleshooting
 
 **"DEEPGRAM_API_KEY not set" / no transcripts**
-Verify `.env` is populated and Flask loaded it: `curl http://localhost:5000/health`
+Verify `.env` is populated and Flask loaded it: `curl http://localhost:8000/health`
 
 **"Error connecting to Redis"**
 Start Redis: `redis-server --daemonize yes` or `brew services start redis`
@@ -472,7 +472,7 @@ mkdir -p chroma_store && chmod 755 chroma_store
 ```
 
 **WebSocket CORS error in browser**
-- Confirm `VITE_WS_URL=http://localhost:5000` is set in `.env`
+- Confirm `VITE_WS_URL=http://localhost:8000` is set in `.env`
 - Vite's proxy (`frontend/vite.config.js`) must forward `/socket.io/*` to Flask
 - JWT must be passed in Socket.IO handshake auth
 
@@ -497,7 +497,7 @@ Make sure `DATABASE_URL` uses the **Pooler URI** (port `6543`, Transaction mode)
 | `CHROMA_PATH` | No | `./chroma_store` | ChromaDB storage path |
 | `UPLOAD_FOLDER` | No | `./uploads` | File upload directory |
 | `MAX_UPLOAD_MB` | No | `200` | Max file size in MB |
-| `FLASK_PORT` | No | `5000` | Flask server port |
+| `FLASK_PORT` | No | `8000` | Flask server port |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
 | `OPENROUTER_HEAVY_MODEL` | No | `anthropic/claude-sonnet-4-5` | LLM for summaries |
 | `OPENROUTER_LIGHT_MODEL` | No | `anthropic/claude-haiku-4-5-20251001` | LLM for light tasks |

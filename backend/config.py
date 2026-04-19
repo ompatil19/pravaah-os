@@ -61,7 +61,7 @@ ALLOWED_MIME_TYPES = {
 # ---------------------------------------------------------------------------
 FLASK_ENV: str = os.environ.get("FLASK_ENV", "development")
 FLASK_HOST: str = os.environ.get("FLASK_HOST", "0.0.0.0")
-FLASK_PORT: int = int(os.environ.get("FLASK_PORT", "5000"))
+FLASK_PORT: int = int(os.environ.get("FLASK_PORT", "8000"))
 FLASK_DEBUG: bool = FLASK_ENV == "development"
 
 CORS_ORIGINS: list[str] = [

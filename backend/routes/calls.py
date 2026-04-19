@@ -25,6 +25,7 @@ from ..models import (
 )
 from ..auth import require_auth
 from ..utils import error, get_pagination_params, now_iso, ok, parse_iso
+from .. import socket_handlers
 
 logger = logging.getLogger(__name__)
 calls_bp = Blueprint("calls", __name__, url_prefix="/api/calls")
@@ -50,7 +51,7 @@ def start_call():
         session_id = str(uuid.uuid4())
         created_at = now_iso()
 
-        call_id = db.insert_call(session_id, agent_id, language, metadata_str, created_at)
+        call_id = db.insert_call(session_id, agent_id, language, call_metadata=metadata_str, created_at=created_at)
 
         return ok(
             {
@@ -79,7 +80,7 @@ def end_call(session_id: str):
         if not call_row:
             return error("CALL_NOT_FOUND", f"Session {session_id} not found.", 404)
 
-        if call_row["status"] == "ended":
+        if call_row.status == "ended":
             return ok(
                 {
                     "session_id": session_id,
@@ -89,19 +90,16 @@ def end_call(session_id: str):
             )
 
         ended_at = now_iso()
-        created_at_dt = parse_iso(call_row["created_at"])
+        created_at_dt = parse_iso(call_row.created_at)
         ended_at_dt = parse_iso(ended_at)
         duration = 0
         if created_at_dt and ended_at_dt:
             duration = max(0, int((ended_at_dt - created_at_dt).total_seconds()))
 
         db.end_call(session_id, ended_at, duration)
+        socket_handlers.close_session(session_id)  # stop STT WebSocket
 
         transcript_count = db.count_transcripts(session_id)
-
-        # Fire async summary if transcripts exist and no summary yet
-        if transcript_count > 0 and not db.get_summary(session_id):
-            _trigger_summary_async(session_id)
 
         return ok(
             {
@@ -121,7 +119,7 @@ def end_call(session_id: str):
 # GET /api/calls
 # ---------------------------------------------------------------------------
 
-@calls_bp.route("/", methods=["GET"])
+@calls_bp.route("", methods=["GET"])
 @require_auth()
 def list_calls():
     """Paginated call list with optional filters."""
@@ -140,10 +138,10 @@ def list_calls():
 
         calls = []
         for row in rows:
-            summary_row = db.get_summary(row["session_id"])
+            summary_row = db.get_summary(row.session_id)
             preview = None
             if summary_row:
-                preview = (summary_row["text"] or "")[:120]
+                preview = (summary_row.text or "")[:120]
             calls.append(call_list_item(row, preview))
 
         return ok(
@@ -214,7 +212,7 @@ def _generate_summary(session_id: str) -> None:
         if not transcript_rows:
             return
 
-        full_text = " ".join(r["text"] for r in transcript_rows if r["is_final"])
+        full_text = " ".join(r.text for r in transcript_rows if r.is_final)
         if not full_text.strip():
             return
 

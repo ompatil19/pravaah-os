@@ -20,17 +20,17 @@ logger = logging.getLogger(__name__)
 # Deepgram WebSocket endpoint
 _DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen"
 
-# Query parameters matching ARCHITECTURE.md §3.3
+# Query parameters for Deepgram Nova-2 streaming WebSocket.
+# NOTE: Do NOT specify encoding/sample_rate for browser MediaRecorder audio.
+# Browser sends audio/webm;codecs=opus — Deepgram auto-detects from container.
+# Specifying encoding=webm-opus causes HTTP 400 (invalid value).
 _DEFAULT_PARAMS = {
     "model": "nova-2",
-    "language": "hi-en",
+    "language": "hi",
     "punctuate": "true",
     "interim_results": "true",
     "smart_format": "true",
     "endpointing": "500",
-    "encoding": "webm-opus",
-    "sample_rate": "48000",
-    "channels": "1",
 }
 
 _MAX_RECONNECT_ATTEMPTS = 3
@@ -69,6 +69,9 @@ class DeepgramSTTClient:
         self._connected: bool = False
         self._closing: bool = False
         self._receive_task: Optional[asyncio.Task] = None
+        # Buffer chunks that arrive before the WebSocket is ready
+        self._pre_connect_buffer: list = []
+        self._MAX_BUFFER_CHUNKS: int = 40  # ~10 s at 250 ms slices
 
     # ------------------------------------------------------------------
     # Public API
@@ -93,7 +96,11 @@ class DeepgramSTTClient:
             Raw audio bytes from the browser MediaRecorder (webm/opus).
         """
         if not self._connected or self._ws is None:
-            logger.warning("send_audio called but STT client is not connected; dropping chunk")
+            if not self._closing and len(self._pre_connect_buffer) < self._MAX_BUFFER_CHUNKS:
+                self._pre_connect_buffer.append(chunk)
+                logger.debug("STT not yet connected; buffering chunk (%d buffered)", len(self._pre_connect_buffer))
+            else:
+                logger.warning("send_audio: not connected and buffer full or closing; dropping chunk")
             return
         try:
             await self._ws.send(chunk)
@@ -104,6 +111,16 @@ class DeepgramSTTClient:
                 logger.info("Attempting to reconnect after send failure…")
                 await self._connect_with_retry()
 
+    def mark_closing(self) -> None:
+        """
+        Synchronously mark this client as closing so reconnection is suppressed.
+
+        Call this from synchronous code before scheduling the async close(),
+        to avoid a race where Deepgram drops the connection (e.g. 1011 timeout)
+        before the async close() coroutine has a chance to set _closing = True.
+        """
+        self._closing = True
+
     async def close(self) -> None:
         """
         Gracefully shut down the WebSocket connection.
@@ -113,6 +130,7 @@ class DeepgramSTTClient:
         """
         self._closing = True
         self._connected = False
+        self._pre_connect_buffer.clear()
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
             try:
@@ -141,7 +159,9 @@ class DeepgramSTTClient:
         params = _DEFAULT_PARAMS.copy()
         # Allow env-var overrides for model
         params["model"] = os.getenv("DEEPGRAM_STT_MODEL", params["model"])
-        return f"{_DEEPGRAM_WS_URL}?{urlencode(params)}"
+        url = f"{_DEEPGRAM_WS_URL}?{urlencode(params)}"
+        logger.info("Deepgram STT URL: %s", url)
+        return url
 
     def _build_headers(self) -> dict:
         """Return the Authorization headers required by Deepgram."""
@@ -153,6 +173,9 @@ class DeepgramSTTClient:
 
         Raises the final exception if all attempts are exhausted.
         """
+        if self._closing:
+            logger.debug("STT client is closing; skipping reconnect")
+            return
         url = self._build_url()
         headers = self._build_headers()
         last_exc: Optional[Exception] = None
@@ -167,16 +190,34 @@ class DeepgramSTTClient:
                 self._connected = True
                 self._closing = False
                 logger.info("Connected to Deepgram STT WebSocket")
+                # Flush any audio that arrived before the connection was ready
+                if self._pre_connect_buffer:
+                    logger.info("Flushing %d buffered audio chunks to Deepgram", len(self._pre_connect_buffer))
+                    for buffered_chunk in self._pre_connect_buffer:
+                        try:
+                            await self._ws.send(buffered_chunk)
+                        except Exception as flush_exc:
+                            logger.warning("Error flushing buffered chunk: %s", flush_exc)
+                            break
+                    self._pre_connect_buffer.clear()
                 # Kick off background receive loop
                 self._receive_task = asyncio.create_task(self._receive_loop())
                 return
             except (OSError, WebSocketException, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 backoff = _BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                # Log response body for HTTP errors to aid debugging
+                body = ""
+                if hasattr(exc, "response") and exc.response is not None:
+                    try:
+                        body = f" | body: {exc.response.body.decode()}"
+                    except Exception:
+                        body = f" | headers: {dict(getattr(exc.response, 'headers', {}))}"
                 logger.warning(
-                    "Deepgram STT connect attempt %d failed: %s. Retrying in %.1fs…",
+                    "Deepgram STT connect attempt %d failed: %s%s. Retrying in %.1fs…",
                     attempt,
                     exc,
+                    body,
                     backoff,
                 )
                 await asyncio.sleep(backoff)

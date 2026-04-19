@@ -209,6 +209,7 @@ def ingest_document(
     redis_url: str,
     chroma_path: str,
     openrouter_api_key: str,
+    job_id: str | None = None,
 ) -> None:
     """
     Ingest a document into ChromaDB and update the database.
@@ -245,8 +246,17 @@ def ingest_document(
     from .embeddings import EmbeddingClient
 
     # ------------------------------------------------------------------
-    # Setup
+    # Setup — resolve job_id from RQ context if not passed explicitly
     # ------------------------------------------------------------------
+    if job_id is None:
+        try:
+            from rq import get_current_job
+            rq_job = get_current_job()
+            if rq_job:
+                job_id = rq_job.id
+        except Exception:
+            pass
+
     redis_client = redis_lib.from_url(redis_url)
     channel = f"doc:{doc_id}:progress"
 
@@ -257,8 +267,40 @@ def ingest_document(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Redis publish failed: %s", exc)
 
+    def _update_job_status(status: str, engine, error_msg: str | None = None) -> None:
+        """Update the jobs table row for this ingest job."""
+        if not job_id:
+            return
+        try:
+            with engine.begin() as conn:
+                if status in ("finished", "failed"):
+                    conn.execute(
+                        sa.text(
+                            "UPDATE jobs SET status=:status, completed_at=CURRENT_TIMESTAMP "
+                            "WHERE job_id=:job_id"
+                        ),
+                        {"status": status, "job_id": job_id},
+                    )
+                else:
+                    conn.execute(
+                        sa.text("UPDATE jobs SET status=:status WHERE job_id=:job_id"),
+                        {"status": status, "job_id": job_id},
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to update job %s status to %s: %s", job_id, status, exc)
+
     try:
         encoder = tiktoken.get_encoding("cl100k_base")
+
+        # Mark job as started and document as processing
+        _engine_early = sa.create_engine(db_url)
+        with _engine_early.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE documents SET status='processing' WHERE doc_id=:doc_id"),
+                {"doc_id": doc_id},
+            )
+        _update_job_status("started", _engine_early)
+        _engine_early.dispose()
 
         # ------------------------------------------------------------------
         # Step 1 — Extract text
@@ -274,7 +316,7 @@ def ingest_document(
             raise ValueError(f"Unsupported file extension: {ext!r}")
 
         total_pages = len(raw_pages)
-        _publish({"event": "extracted", "pages": total_pages})
+        _publish({"status": "extracting", "event": "extracted", "pages": total_pages})
         logger.info("doc=%s extracted %d pages from %s", doc_id, total_pages, file_path)
 
         # ------------------------------------------------------------------
@@ -309,7 +351,9 @@ def ingest_document(
             pct = int(done / max(total_chunks, 1) * 100)
             _publish(
                 {
+                    "status": "embedding",
                     "event": "embedding",
+                    "progress": pct,
                     "pct": pct,
                     "chunks_done": done,
                     "total": total_chunks,
@@ -318,10 +362,19 @@ def ingest_document(
 
         # ------------------------------------------------------------------
         # Step 4 — Store in ChromaDB
+        # On retry runs we delete the old collection first to avoid duplicate-id
+        # errors from a previous partial ingest.
         # ------------------------------------------------------------------
         chroma_client = chromadb.PersistentClient(path=chroma_path)
-        collection = chroma_client.get_or_create_collection(
-            name=f"doc_{doc_id}",
+        collection_name = f"doc_{doc_id}"
+        try:
+            chroma_client.delete_collection(collection_name)
+            logger.info("doc=%s deleted stale ChromaDB collection before re-ingest", doc_id)
+        except Exception:
+            pass  # Collection didn't exist — that's fine
+
+        collection = chroma_client.create_collection(
+            name=collection_name,
             metadata={"hnsw:space": "cosine"},
         )
 
@@ -346,15 +399,21 @@ def ingest_document(
         logger.info("doc=%s stored %d chunks in ChromaDB", doc_id, total_chunks)
 
         # ------------------------------------------------------------------
-        # Step 5 — Update DB
+        # Step 5 — Update DB (wipe old chunks first, then re-insert cleanly)
         # ------------------------------------------------------------------
         engine = sa.create_engine(db_url)
         with engine.begin() as conn:
+            # Remove stale chunk rows from any previous partial ingest
+            conn.execute(
+                sa.text("DELETE FROM document_chunks WHERE doc_id=:doc_id"),
+                {"doc_id": doc_id},
+            )
+
             # Update documents table
             conn.execute(
                 sa.text(
                     "UPDATE documents SET status='completed', total_pages=:tp, "
-                    "total_chunks=:tc WHERE id=:doc_id"
+                    "total_chunks=:tc WHERE doc_id=:doc_id"
                 ),
                 {"tp": total_pages, "tc": total_chunks, "doc_id": doc_id},
             )
@@ -376,29 +435,30 @@ def ingest_document(
                     },
                 )
 
+        _update_job_status("finished", engine)
         logger.info("doc=%s DB update complete", doc_id)
 
         # ------------------------------------------------------------------
         # Done
         # ------------------------------------------------------------------
         _publish(
-            {"event": "done", "total_chunks": total_chunks, "total_pages": total_pages}
+            {"status": "done", "event": "done", "total_chunks": total_chunks, "total_pages": total_pages}
         )
 
     except Exception as exc:  # noqa: BLE001
         logger.error("doc=%s ingest failed: %s", doc_id, exc, exc_info=True)
-        _publish({"event": "error", "message": str(exc)})
+        _publish({"status": "failed", "event": "error", "message": str(exc)})
 
-        # Mark document as failed in DB
+        # Mark document and job as failed in DB
         try:
-            engine = sa.create_engine(db_url)  # type: ignore[possibly-undefined]
-            with engine.begin() as conn:
+            _fail_engine = sa.create_engine(db_url)  # type: ignore[possibly-undefined]
+            with _fail_engine.begin() as conn:
                 conn.execute(
-                    sa.text(
-                        "UPDATE documents SET status='failed' WHERE id=:doc_id"
-                    ),
+                    sa.text("UPDATE documents SET status='failed' WHERE doc_id=:doc_id"),
                     {"doc_id": doc_id},
                 )
+            _update_job_status("failed", _fail_engine)
+            _fail_engine.dispose()
         except Exception as db_exc:  # noqa: BLE001
             logger.error("doc=%s failed to update DB status to failed: %s", doc_id, db_exc)
 

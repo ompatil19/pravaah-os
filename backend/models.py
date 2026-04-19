@@ -86,7 +86,7 @@ class Call(Base):
     agent_id = Column(String, nullable=False, default="unknown")
     status = Column(String, nullable=False, default="active")
     language = Column(String, nullable=False, default="hi-en")
-    metadata = Column(Text)
+    call_metadata = Column(Text)
     created_at = Column(String, nullable=False)
     ended_at = Column(String)
     duration_seconds = Column(Integer)
@@ -102,7 +102,7 @@ class Call(Base):
             "agent_id": self.agent_id,
             "status": self.status,
             "language": self.language,
-            "metadata": self.metadata,
+            "metadata": self.call_metadata,
             "created_at": self.created_at,
             "ended_at": self.ended_at,
             "duration_seconds": self.duration_seconds,
@@ -260,7 +260,7 @@ def call_to_dict(row) -> dict[str, Any]:
         "agent_id": _get(row, "agent_id"),
         "status": _get(row, "status"),
         "language": _get(row, "language"),
-        "metadata": _get(row, "metadata"),
+        "metadata": _get(row, "call_metadata"),
         "created_at": _get(row, "created_at"),
         "ended_at": _get(row, "ended_at"),
         "duration_seconds": _get(row, "duration_seconds"),

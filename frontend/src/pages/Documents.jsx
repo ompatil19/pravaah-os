@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import { documentsApi, searchDocuments } from '../api';
 import DocProgressBar from '../components/DocProgressBar';
 
@@ -212,7 +212,7 @@ function DocumentRow({ doc, isSelected, onToggleSelect }) {
   return (
     <div
       className="animate-fade-up"
-      onClick={() => onToggleSelect(doc.id)}
+      onClick={() => onToggleSelect(doc.doc_id)}
       style={{
         padding: '0.85rem 1rem',
         marginBottom: '0.5rem',
@@ -245,7 +245,7 @@ function DocumentRow({ doc, isSelected, onToggleSelect }) {
         <p style={{ fontFamily: 'var(--font-mono)', fontSize: '0.62rem', color: 'var(--muted)' }}>
           {(doc.size_bytes / 1024).toFixed(1)} KB
         </p>
-        <DocProgressBar docId={doc.id} initialStatus={doc.status || 'QUEUED'} />
+        <DocProgressBar docId={doc.doc_id} initialStatus={doc.status || 'QUEUED'} />
       </div>
 
       {/* Checkbox */}
@@ -338,11 +338,11 @@ function RagQueryPanel({ documents }) {
           </p>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
             {documents.map((doc) => {
-              const sel = selectedDocIds.includes(doc.id);
+              const sel = selectedDocIds.includes(doc.doc_id);
               return (
                 <button
-                  key={doc.id}
-                  onClick={() => toggleDoc(doc.id)}
+                  key={doc.doc_id}
+                  onClick={() => toggleDoc(doc.doc_id)}
                   style={{
                     padding: '3px 10px',
                     borderRadius: '6px',
@@ -565,12 +565,20 @@ export default function Documents() {
   const [documents,       setDocuments]       = useState([]);
   const [selectedDocIds,  setSelectedDocIds]  = useState([]);
 
+  // Load existing documents on mount
+  useEffect(() => {
+    documentsApi.list().then(({ data }) => {
+      setDocuments(data.documents || []);
+    }).catch(() => {});
+  }, []);
+
   const handleUploaded = (doc) => {
-    setDocuments((prev) => [{ ...doc, status: 'QUEUED' }, ...prev]);
+    // Use status from server response (not hardcoded)
+    setDocuments((prev) => [doc, ...prev]);
   };
 
-  const toggleSelect = (id) =>
-    setSelectedDocIds((prev) => prev.includes(id) ? prev.filter((d) => d !== id) : [...prev, id]);
+  const toggleSelect = (docId) =>
+    setSelectedDocIds((prev) => prev.includes(docId) ? prev.filter((d) => d !== docId) : [...prev, docId]);
 
   return (
     <div className="mesh-bg" style={{ minHeight: '100vh', padding: '1.75rem' }}>
@@ -609,9 +617,9 @@ export default function Documents() {
             </p>
             {documents.map((doc) => (
               <DocumentRow
-                key={doc.id}
+                key={doc.doc_id}
                 doc={doc}
-                isSelected={selectedDocIds.includes(doc.id)}
+                isSelected={selectedDocIds.includes(doc.doc_id)}
                 onToggleSelect={toggleSelect}
               />
             ))}

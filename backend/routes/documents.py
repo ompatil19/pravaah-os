@@ -51,54 +51,75 @@ def _guess_mime(ext: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
-def _enqueue_ingest(doc_id: str, storage_path: str, mime_type: str) -> str | None:
+def _enqueue_ingest(doc_id: str, storage_path: str, mime_type: str, job_id: str | None = None) -> str | None:
     """
     Enqueue the ingest_document RQ job. Returns the RQ job_id or None on failure.
     Falls back to synchronous inline text extraction if Redis/RQ unavailable.
+    Pass job_id to reuse the same ID already inserted in the jobs table.
     """
     try:
         import redis as _redis
-        from rq import Queue
+        from rq import Queue, Retry
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
         r = _redis.Redis.from_url(redis_url)
         q = Queue("pravaah", connection=r)
 
-        # Try to import the worker task
-        try:
-            from pipeline.workers import ingest_document
-        except ImportError:
-            # Fallback: define a minimal inline task reference
-            ingest_document = _inline_ingest
+        from pipeline.document_processor import ingest_document
+
+        # Resolve runtime config — worker runs outside Flask context so all
+        # values must be passed explicitly as job arguments.
+        db_url = os.environ.get("DATABASE_URL", "")
+        if not db_url:
+            from ..config import DATABASE_PATH
+            db_url = f"sqlite:///{DATABASE_PATH}"
+        chroma_path = os.environ.get("CHROMA_PATH", os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "chroma_db",
+        ))
+        openrouter_api_key = os.environ.get("OPENROUTER_API_KEY", "")
 
         job = q.enqueue(
             ingest_document,
-            doc_id=doc_id,
-            storage_path=storage_path,
-            mime_type=mime_type,
-            job_timeout=600,
+            # Positional args — must match ingest_document signature exactly.
+            # Using args= avoids any clash with RQ's own keyword params.
+            args=(doc_id, storage_path, db_url, redis_url, chroma_path, openrouter_api_key),
+            job_id=job_id,
+            job_timeout=3600,  # 1 h — large PDFs with many chunks can take a while
+            retry=Retry(max=3, interval=[30, 60, 120]),
         )
         return job.id
     except Exception as exc:
         logger.warning("RQ enqueue failed (%s), using inline extraction.", exc)
-        _inline_ingest(doc_id=doc_id, storage_path=storage_path, mime_type=mime_type)
+        _inline_ingest(doc_id=doc_id, storage_path=storage_path, mime_type=mime_type, job_id=job_id)
         return None
 
 
-def _inline_ingest(doc_id: str, storage_path: str, mime_type: str, **kwargs) -> None:
+def _inline_ingest(doc_id: str, storage_path: str, mime_type: str, job_id: str | None = None, **kwargs) -> None:
     """
     Inline (synchronous) document ingestion fallback when RQ is unavailable.
     Extracts text and updates document status.
     """
+    # When called by the RQ worker, job_id isn't passed as a function kwarg
+    # (RQ consumes job_id as its own parameter). Detect it from the RQ job context.
+    if job_id is None:
+        try:
+            from rq import get_current_job
+            rq_job = get_current_job()
+            if rq_job:
+                job_id = rq_job.id
+        except Exception:
+            pass
+
     import threading
     threading.Thread(
         target=_extract_text_sync,
-        args=(doc_id, storage_path, mime_type),
+        args=(doc_id, storage_path, mime_type, job_id),
         daemon=True,
         name=f"extract-{doc_id}",
     ).start()
 
 
-def _extract_text_sync(doc_id: str, storage_path: str, mime_type: str) -> None:
+def _extract_text_sync(doc_id: str, storage_path: str, mime_type: str, job_id: str | None = None) -> None:
     """Background text extraction (inline fallback, no RQ)."""
     try:
         db.update_document_status(doc_id, "processing")
@@ -134,6 +155,8 @@ def _extract_text_sync(doc_id: str, storage_path: str, mime_type: str) -> None:
             total_pages=1,
             total_chunks=len(chunks),
         )
+        if job_id:
+            db.update_job(job_id, "finished")
         logger.info("[%s] Inline ingest complete: %d chunks.", doc_id, len(chunks))
 
         # Publish progress event to Redis if available
@@ -142,6 +165,8 @@ def _extract_text_sync(doc_id: str, storage_path: str, mime_type: str) -> None:
     except Exception as exc:
         logger.error("[%s] Inline ingest failed: %s", doc_id, exc)
         db.update_document_status(doc_id, "failed")
+        if job_id:
+            db.update_job(job_id, "failed", error=str(exc))
         _publish_progress(doc_id, {"status": "failed", "error": str(exc)})
 
 
@@ -192,6 +217,29 @@ def _publish_progress(doc_id: str, data: dict) -> None:
         r.publish(f"doc:{doc_id}:progress", json.dumps(data))
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# GET /api/documents  (list)
+# ---------------------------------------------------------------------------
+
+@documents_bp.route("", methods=["GET"])
+@require_auth()
+def list_documents():
+    """Return paginated list of all documents."""
+    try:
+        page = int(request.args.get("page", 1))
+        per_page = int(request.args.get("per_page", 50))
+        docs, total = db.list_documents(page=page, per_page=per_page)
+        return ok({
+            "documents": [d.to_dict() for d in docs],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+        })
+    except Exception as exc:
+        logger.exception("Error listing documents: %s", exc)
+        return error("LIST_DOCUMENTS_FAILED", str(exc), 500)
 
 
 # ---------------------------------------------------------------------------
@@ -275,19 +323,9 @@ def upload_document():
             status="processing",
         )
 
-        # Enqueue RQ job (may update job_id to actual RQ id)
-        actual_rq_job_id = _enqueue_ingest(doc_id, storage_path, mime_type)
-        if actual_rq_job_id and actual_rq_job_id != rq_job_id_placeholder:
-            db.update_document_status(doc_id, "processing", job_id=actual_rq_job_id)
-            db.update_job(rq_job_id_placeholder, "finished")
-            db.insert_job(
-                job_id=actual_rq_job_id,
-                job_type="ingest_document",
-                payload_json=json.dumps({"doc_id": doc_id, "storage_path": storage_path}),
-                status="queued",
-            )
-
-        final_job_id = actual_rq_job_id or rq_job_id_placeholder
+        # Enqueue RQ job — pass placeholder as the RQ job_id so they match
+        _enqueue_ingest(doc_id, storage_path, mime_type, job_id=rq_job_id_placeholder)
+        final_job_id = rq_job_id_placeholder
 
         # Subscribe Socket.IO room to Redis pub/sub for progress (best-effort)
         try:
@@ -400,9 +438,11 @@ def search_documents():
         # Attempt RAGEngine query
         try:
             import redis as _redis
-            from flask import current_app
             from pipeline.rag_engine import RAGEngine
-            _chroma_path = os.getenv("CHROMA_PATH", "./chroma_store")
+            _chroma_path = os.getenv("CHROMA_PATH", os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                "chroma_db",
+            ))
             _openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
             _redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
             try:
@@ -411,20 +451,34 @@ def search_documents():
             except Exception:
                 _rc = None
             rag = RAGEngine(chroma_path=_chroma_path, openrouter_api_key=_openrouter_key, redis_client=_rc)
-            results = rag.query(query=query, doc_ids=doc_ids, top_k=top_k)
+            rag_result = rag.query(question=query, doc_ids=doc_ids, top_k=top_k)
+            rag.close()
         except ImportError:
-            # RAGEngine not yet implemented — return empty results gracefully
-            results = []
-            logger.warning("RAGEngine not available; returning empty search results.")
+            rag_result = {"answer": "RAG not available.", "sources": [], "cached": False}
+            logger.warning("RAGEngine not available; returning empty results.")
         except Exception as exc:
             logger.error("RAGEngine query failed: %s", exc)
             return error("RAG_QUERY_FAILED", str(exc), 500)
 
+        # Enrich sources: add doc_name and normalise chunk_text_preview → chunk_preview
+        for src in rag_result.get("sources", []):
+            did = src.get("doc_id", "")
+            if did and "doc_name" not in src:
+                try:
+                    doc_row = db.get_document(did)
+                    src["doc_name"] = doc_row.filename if doc_row else did
+                except Exception:
+                    src["doc_name"] = did
+            if "chunk_text_preview" in src:
+                src["chunk_preview"] = src.pop("chunk_text_preview")
+
+        # Return answer + sources at top level — matches frontend expectations
         return ok(
             {
                 "query": query,
-                "results": results,
-                "count": len(results),
+                "answer": rag_result.get("answer", ""),
+                "sources": rag_result.get("sources", []),
+                "cached": rag_result.get("cached", False),
             }
         )
     except Exception as exc:

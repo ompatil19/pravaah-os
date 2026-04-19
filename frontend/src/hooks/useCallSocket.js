@@ -3,10 +3,11 @@ import socket from '../socket';
 
 /**
  * useCallSocket
- * Returns { transcripts, summary, actionItems, isConnected, error, sendAudioChunk }
+ * Returns { transcripts, aiReplies, summary, actionItems, isConnected, error, sendAudioChunk }
  */
 export default function useCallSocket(sessionId) {
   const [transcripts,  setTranscripts]  = useState([]);
+  const [aiReplies,    setAiReplies]    = useState([]);
   const [summary,      setSummary]      = useState(null);
   const [actionItems,  setActionItems]  = useState([]);
   const [isConnected,  setIsConnected]  = useState(false);
@@ -81,6 +82,14 @@ export default function useCallSocket(sessionId) {
       });
     };
 
+    const onAiReply = (data) => {
+      if (data.session_id !== sessionIdRef.current) return;
+      setAiReplies((prev) => [
+        ...prev,
+        { id: `ai-${Date.now()}`, text: data.text, timestamp: new Date().toISOString() },
+      ]);
+    };
+
     const onCallSummary = (data) => {
       if (data.session_id !== sessionIdRef.current) return;
       setSummary(data.summary);
@@ -102,6 +111,7 @@ export default function useCallSocket(sessionId) {
     socket.on('connect_error',      onConnectError);
     socket.on('transcript_interim', onTranscriptInterim);
     socket.on('transcript_final',   onTranscriptFinal);
+    socket.on('ai_reply',           onAiReply);
     socket.on('call_summary',       onCallSummary);
     socket.on('action_items',       onActionItems);
     socket.on('error',              onError);
@@ -113,10 +123,13 @@ export default function useCallSocket(sessionId) {
       socket.off('connect_error',      onConnectError);
       socket.off('transcript_interim', onTranscriptInterim);
       socket.off('transcript_final',   onTranscriptFinal);
+      socket.off('ai_reply',           onAiReply);
       socket.off('call_summary',       onCallSummary);
       socket.off('action_items',       onActionItems);
       socket.off('error',              onError);
-      socket.disconnect();
+      // Do not disconnect the singleton socket here — calling connect() on a
+      // socket that is mid-close throws "WebSocket is closed before the
+      // connection is established". Disconnect explicitly via disconnectSocket().
     };
   }, [sessionId]);
 
@@ -134,5 +147,9 @@ export default function useCallSocket(sessionId) {
     reader.readAsDataURL(blob);
   }, []);
 
-  return { transcripts, summary, actionItems, isConnected, error, sendAudioChunk };
+  const disconnectSocket = useCallback(() => {
+    if (socket.connected) socket.disconnect();
+  }, []);
+
+  return { transcripts, aiReplies, summary, actionItems, isConnected, error, sendAudioChunk, disconnectSocket };
 }

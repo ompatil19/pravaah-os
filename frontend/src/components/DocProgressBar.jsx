@@ -1,42 +1,101 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import socket from '../socket';
+import { getDocumentStatus } from '../api';
 
 const STATUS_CONFIG = {
-  QUEUED:     { label: 'Queued',     color: 'var(--muted)',    bg: 'rgba(90,100,128,0.12)',  progress: 5,    pulse: false },
-  EXTRACTING: { label: 'Extracting', color: 'var(--warning)',  bg: 'rgba(255,184,0,0.1)',    progress: 30,   pulse: true  },
-  EMBEDDING:  { label: 'Embedding',  color: 'var(--cyan)',     bg: 'rgba(0,200,255,0.1)',    progress: null, pulse: true  },
-  DONE:       { label: 'Done',       color: 'var(--success)',  bg: 'rgba(0,229,160,0.1)',    progress: 100,  pulse: false },
-  FAILED:     { label: 'Failed',     color: 'var(--danger)',   bg: 'rgba(255,51,102,0.1)',   progress: 100,  pulse: false },
+  QUEUED:      { label: 'Queued',      color: 'var(--muted)',    bg: 'rgba(90,100,128,0.12)',  progress: 5,    pulse: false },
+  PROCESSING:  { label: 'Processing',  color: 'var(--warning)',  bg: 'rgba(255,184,0,0.1)',    progress: 20,   pulse: true  },
+  EXTRACTING:  { label: 'Extracting',  color: 'var(--warning)',  bg: 'rgba(255,184,0,0.1)',    progress: 30,   pulse: true  },
+  EMBEDDING:   { label: 'Embedding',   color: 'var(--cyan)',     bg: 'rgba(0,200,255,0.1)',    progress: null, pulse: true  },
+  DONE:        { label: 'Done',        color: 'var(--success)',  bg: 'rgba(0,229,160,0.1)',    progress: 100,  pulse: false },
+  COMPLETED:   { label: 'Done',        color: 'var(--success)',  bg: 'rgba(0,229,160,0.1)',    progress: 100,  pulse: false },
+  FAILED:      { label: 'Failed',      color: 'var(--danger)',   bg: 'rgba(255,51,102,0.1)',   progress: 100,  pulse: false },
 };
 
+// Map DB document status → display status key
+const DB_STATUS_MAP = {
+  uploading:  'QUEUED',
+  processing: 'PROCESSING',
+  completed:  'DONE',
+  failed:     'FAILED',
+};
+
+const TERMINAL_STATES = new Set(['DONE', 'COMPLETED', 'FAILED']);
+
 export default function DocProgressBar({ docId, initialStatus = 'QUEUED', onComplete }) {
-  const [status,            setStatus]            = useState(initialStatus?.toUpperCase() || 'QUEUED');
+  const [status,            setStatus]            = useState(() => {
+    const s = initialStatus?.toLowerCase();
+    return DB_STATUS_MAP[s] || initialStatus?.toUpperCase() || 'QUEUED';
+  });
   const [embeddingProgress, setEmbeddingProgress] = useState(0);
   const [meta,              setMeta]              = useState({ totalPages: null, totalChunks: null });
+  const pollRef = useRef(null);
 
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  const applyStatus = useCallback((newStatus) => {
+    setStatus(newStatus);
+    if (TERMINAL_STATES.has(newStatus)) stopPolling();
+  }, [stopPolling]);
+
+  // Socket.IO — real-time events from Redis pub/sub bridge
   const handleDocProgress = useCallback((data) => {
     if (data.doc_id !== docId) return;
     const newStatus = data.status?.toUpperCase();
-    if (newStatus) setStatus(newStatus);
+    if (newStatus) applyStatus(newStatus);
     if (newStatus === 'EMBEDDING' && data.progress != null) setEmbeddingProgress(data.progress);
-    if (newStatus === 'DONE') {
+    if (newStatus === 'DONE' || newStatus === 'COMPLETED') {
       setMeta({ totalPages: data.total_pages ?? null, totalChunks: data.total_chunks ?? null });
       if (onComplete) onComplete(data);
     }
-  }, [docId, onComplete]);
+  }, [docId, onComplete, applyStatus]);
+
+  // Polling fallback — catches cases where Socket.IO events arrive before subscription
+  const poll = useCallback(async () => {
+    try {
+      const { data } = await getDocumentStatus(docId);
+      const mapped = DB_STATUS_MAP[data.status] || data.status?.toUpperCase() || 'QUEUED';
+      applyStatus(mapped);
+      if (mapped === 'DONE' || mapped === 'COMPLETED') {
+        setMeta({ totalPages: data.total_pages ?? null, totalChunks: data.total_chunks ?? null });
+        if (onComplete) onComplete(data);
+      }
+    } catch {
+      // ignore transient poll errors
+    }
+  }, [docId, applyStatus, onComplete]);
 
   useEffect(() => {
+    if (!docId) return;
+
+    // Socket.IO subscription
     if (!socket.connected) socket.connect();
+    socket.emit('subscribe_doc_progress', { doc_id: docId });
     socket.on('doc_progress', handleDocProgress);
-    return () => socket.off('doc_progress', handleDocProgress);
-  }, [handleDocProgress]);
+
+    // Start polling immediately, then every 3 seconds
+    if (!TERMINAL_STATES.has(status)) {
+      poll();
+      pollRef.current = setInterval(poll, 3000);
+    }
+
+    return () => {
+      socket.off('doc_progress', handleDocProgress);
+      stopPolling();
+    };
+  }, [docId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.QUEUED;
   const progressPct = status === 'EMBEDDING'
     ? Math.max(31, Math.min(99, embeddingProgress))
     : cfg.progress;
 
-  const isDone   = status === 'DONE';
+  const isDone   = status === 'DONE' || status === 'COMPLETED';
   const isFailed = status === 'FAILED';
 
   const progressColor = isDone

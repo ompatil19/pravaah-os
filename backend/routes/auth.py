@@ -142,6 +142,18 @@ def me():
 # POST /api/auth/users
 # ---------------------------------------------------------------------------
 
+@auth_bp.route("/users", methods=["GET"])
+@require_auth(roles=["admin"])
+def list_users():
+    """List all users. Admin only."""
+    try:
+        users = db.list_users()
+        return ok({"users": [u.to_dict() for u in users]})
+    except Exception as exc:
+        logger.exception("List users error: %s", exc)
+        return error("LIST_USERS_FAILED", str(exc), 500)
+
+
 @auth_bp.route("/users", methods=["POST"])
 @require_auth(roles=["admin"])
 def create_user():
