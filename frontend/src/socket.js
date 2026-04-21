@@ -11,7 +11,7 @@ const socket = io(WS_URL, {
   reconnectionDelay: 1000,
   reconnectionDelayMax: 16000,
   reconnectionAttempts: 10,
-  transports: ['websocket', 'polling'],
+  transports: ['polling'],
   auth: (cb) => {
     cb({ token: localStorage.getItem('pravaah_access_token') || '' });
   },

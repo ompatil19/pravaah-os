@@ -217,13 +217,11 @@ def _run_realtime_llm(session_id: str, latest_transcript: str, my_gen: int) -> N
         return
     try:
         api_key = os.environ.get("OPENROUTER_API_KEY", "")
-        dg_key = os.environ.get("DEEPGRAM_API_KEY", "")
-        if not api_key or not dg_key:
-            logger.warning("[%s] Missing API keys — skipping LLM/TTS", session_id)
+        if not api_key:
+            logger.warning("[%s] Missing OPENROUTER_API_KEY — skipping LLM", session_id)
             return
 
         from pipeline.openrouter_client import OpenRouterLLMClient
-        from pipeline.deepgram_tts import DeepgramTTSClient
         from pipeline.prompt_templates import SYSTEM_CONVERSATION
 
         # ── Build conversation history ──────────────────────────────────────
@@ -238,13 +236,16 @@ def _run_realtime_llm(session_id: str, latest_transcript: str, my_gen: int) -> N
             messages_snapshot = list(history)
 
         # ── LLM call with full conversation context ─────────────────────────
-        # Default to claude-3-haiku (non-thinking) — haiku-4-5 outputs chain-of-thought
+        # Tight timeout for realtime: if the model doesn't respond in 8s, skip
+        # rather than letting the reply arrive after the call ends.
         llm = OpenRouterLLMClient(api_key=api_key)
         raw_reply = llm._call(
             [{"role": "system", "content": SYSTEM_CONVERSATION}] + messages_snapshot,
-            model=os.environ.get("OPENROUTER_LIGHT_MODEL", "anthropic/claude-3-haiku"),
+            model=os.environ.get("OPENROUTER_LIGHT_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
             temperature=0.7,
             max_tokens=120,
+            timeout=8,
+            max_retries=1,
         )
         llm.close()
         reply = _strip_thinking(raw_reply)
@@ -258,14 +259,8 @@ def _run_realtime_llm(session_id: str, latest_transcript: str, my_gen: int) -> N
 
         logger.info("[%s] LLM reply: %r", session_id, reply[:100])
 
-        # Check if user interrupted before we send TTS
-        with _gen_lock:
-            current_gen = _tts_generation.get(session_id, 0)
-        if current_gen != my_gen:
-            logger.info("[%s] TTS skipped — user interrupted (gen %d → %d)", session_id, my_gen, current_gen)
-            return
-
-        # Emit text reply to frontend (shows in UI)
+        # ── Emit text reply immediately — always show in UI ─────────────────
+        # This is independent of TTS; the interruption check only gates audio.
         if _socketio:
             _socketio.emit(
                 "ai_reply",
@@ -273,7 +268,19 @@ def _run_realtime_llm(session_id: str, latest_transcript: str, my_gen: int) -> N
                 room=session_id,
             )
 
-        # ── TTS synthesis ───────────────────────────────────────────────────
+        # ── TTS synthesis (optional — skip if no Deepgram key or interrupted) ─
+        dg_key = os.environ.get("DEEPGRAM_API_KEY", "")
+        if not dg_key:
+            return
+
+        # Skip TTS if the user has already spoken again
+        with _gen_lock:
+            current_gen = _tts_generation.get(session_id, 0)
+        if current_gen != my_gen:
+            logger.info("[%s] TTS skipped — user interrupted (gen %d → %d)", session_id, my_gen, current_gen)
+            return
+
+        from pipeline.deepgram_tts import DeepgramTTSClient
         tts = DeepgramTTSClient(api_key=dg_key)
         audio_bytes = tts.synthesize(reply)
         tts.close()
@@ -294,7 +301,7 @@ def _run_realtime_llm(session_id: str, latest_transcript: str, my_gen: int) -> N
             )
 
     except Exception as exc:
-        logger.warning("[%s] Real-time LLM/TTS failed: %s", session_id, exc)
+        logger.error("[%s] Real-time LLM/TTS failed: %s", session_id, exc, exc_info=True)
     finally:
         sem.release()
 

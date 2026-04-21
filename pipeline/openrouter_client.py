@@ -95,6 +95,8 @@ class OpenRouterLLMClient:
         model: str,
         temperature: float = 0.3,
         max_tokens: int = 1024,
+        timeout: int = _REQUEST_TIMEOUT_SECONDS,
+        max_retries: int = _MAX_RETRIES,
     ) -> str:
         """
         Send a chat completion request to OpenRouter and return the response text.
@@ -130,13 +132,13 @@ class OpenRouterLLMClient:
         }
         last_exc: Optional[Exception] = None
 
-        for attempt in range(1, _MAX_RETRIES + 1):
+        for attempt in range(1, max_retries + 1):
             try:
-                logger.debug("OpenRouter request attempt %d/%d model=%s", attempt, _MAX_RETRIES, model)
+                logger.debug("OpenRouter request attempt %d/%d model=%s", attempt, max_retries, model)
                 response = self._session.post(
                     self._url,
                     json=payload,
-                    timeout=_REQUEST_TIMEOUT_SECONDS,
+                    timeout=timeout,
                 )
 
                 if response.status_code == 200:
@@ -172,12 +174,12 @@ class OpenRouterLLMClient:
                 logger.error("Failed to parse OpenRouter response: %s", exc)
                 last_exc = exc
 
-            if attempt < _MAX_RETRIES:
+            if attempt < max_retries:
                 backoff = _BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
                 logger.info("Retrying OpenRouter call in %.1fs…", backoff)
                 time.sleep(backoff)
 
-        logger.error("All %d OpenRouter attempts failed", _MAX_RETRIES)
+        logger.error("All %d OpenRouter attempts failed", max_retries)
         raise RuntimeError(f"OpenRouter call failed after {_MAX_RETRIES} attempts") from last_exc
 
     # ------------------------------------------------------------------

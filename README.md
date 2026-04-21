@@ -1,75 +1,114 @@
 # Pravaah OS
 
-> AI-powered voice and document intelligence platform for Indian enterprises.
+> **Multilingual Call Intelligence Platform for Indian Enterprises**
 
-Pravaah OS captures, transcribes, and analyzes multilingual (Hindi-English) calls in real time, then enables semantic search across enterprise document libraries using RAG (Retrieval-Augmented Generation). It ships with JWT authentication, async job queues via Redis/RQ, ChromaDB for vector search, and Supabase (PostgreSQL) as the primary database — without any paid infrastructure beyond Deepgram and OpenRouter.
+Pravaah OS turns live customer service calls into structured, searchable intelligence — in real time. It transcribes Hindi-English code-switched speech, responds via a conversational AI assistant (with voice playback), auto-generates call summaries and action items, and lets teams query their entire call history and document library with natural language.
 
----
-
-## Screenshots
-
-| Dashboard | Live Call | Documents |
-|-----------|-----------|-----------|
-| Real-time call list with filters | Waveform visualizer + live transcript | Drag-and-drop upload with embedding progress |
+Built without any voice frameworks — every layer is wired from first principles so every component is visible, tuneable, and swappable.
 
 ---
 
-## Features
+## Table of Contents
 
-- **Real-time STT** — Deepgram Nova-2 WebSocket streaming, hi-en multilingual
-- **Live transcripts** — speaker-diarized, streamed to browser via Socket.IO
-- **End-of-call LLM** — automatic summary + prioritized action items (Claude Sonnet)
-- **Document RAG** — upload PDFs/DOCX/TXT → chunk → embed → semantic search via ChromaDB
-- **Async jobs** — Redis + RQ queue with progress events and rq-dashboard
-- **JWT auth** — bcrypt password hashing, token refresh, role-based access (agent/supervisor/admin)
-- **Analytics** — call volume, average duration, language breakdown, action item counts
-- **Admin panel** — user management, job queue, system health
+- [What It Solves](#what-it-solves)
+- [Feature Walkthrough](#feature-walkthrough)
+- [Tech Stack](#tech-stack)
+- [Architecture](#architecture)
+- [API Reference](#api-reference)
+- [Socket.IO Events](#socketio-events)
+- [Prerequisites](#prerequisites)
+- [Setup & Installation](#setup--installation)
+- [Environment Variables](#environment-variables)
+- [Running the App](#running-the-app)
+- [Project Structure](#project-structure)
+- [Pages & UI](#pages--ui)
+- [Key Design Decisions](#key-design-decisions)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
-## Architecture
+## What It Solves
 
-```
-Browser (React 18 + Vite + Tailwind)
-    │
-    │  HTTP REST + Bearer JWT          WebSocket (Socket.IO)
-    │  /api/auth  /api/calls           audio_chunk → transcript_*
-    │  /api/documents  /api/jobs       doc_progress events
-    │  /api/analytics  /admin/rq
-    ▼
-┌──────────────────────────────────────────────────────────────┐
-│              Flask Server (Python 3.11 + gevent)             │
-│                                                              │
-│  JWT Auth Layer    Rate Limiter (Redis)    structlog         │
-│                                                              │
-│  Routes: /api/auth  /api/calls  /api/documents               │
-│          /api/analytics  /api/jobs  /admin/rq                │
-│                                                              │
-│  Socket.IO handlers  ←→  SQLAlchemy ORM (Supabase / SQLite)  │
-└──────────────────────────────────────────────────────────────┘
-    │                 │                  │
-    │                 │                  └── Redis (localhost:6379)
-    │                 │                       • Rate limit counters
-    │                 │                       • Analytics cache (TTL 5m)
-    │                 │                       • RQ job queue: pravaah
-    │                 │
-    │                 └── RQ Workers (rq worker pravaah)
-    │                      • ingest_document  → pdfminer → Embeddings → ChromaDB
-    │                      • run_end_of_call_llm → summaries, action items
-    │                      • generate_analytics_cache
-    │
-    ├── Supabase (PostgreSQL)
-    │      users, calls, transcripts, summaries, action_items, documents, jobs
-    │
-    ├── ChromaDB  (local vector store at CHROMA_PATH)
-    │
-    ├── Deepgram Nova-2 STT   wss://api.deepgram.com/v1/listen
-    │
-    ├── Deepgram Aura TTS     https://api.deepgram.com/v1/speak
-    │
-    └── OpenRouter LLM        claude-sonnet-4-5 (heavy) / claude-haiku-4-5 (light)
-                              + openai/text-embedding-3-small (embeddings)
-```
+Indian enterprise call centers handle thousands of multilingual calls every day. The business intelligence inside those calls — customer complaints, agent promises, follow-up actions — is almost impossible to capture at scale.
+
+Pravaah OS sits inside every call and automatically:
+
+1. **Transcribes** mixed Hindi-English speech in real time
+2. **Replies** via an AI assistant so agents get instant, spoken support
+3. **Summarises** every call the moment it ends
+4. **Extracts** prioritised action items with owners and deadlines
+5. **Indexes** uploaded documents for plain-English semantic search
+
+---
+
+## Feature Walkthrough
+
+### Real-Time Call Transcription
+
+- Streams microphone audio from the browser to **Deepgram Nova-2** over a WebSocket
+- Handles Hindi-English code-switched (`hi-en`) speech natively
+- Emits live **interim** transcripts as the speaker talks; persists **final** segments to the database
+- Displays an animated waveform visualiser during the call
+
+### Conversational AI Assistant
+
+- After every final transcript segment, a background thread sends the full conversation history to an LLM via **OpenRouter**
+- Keeps a rolling 20-turn window to bound token usage
+- The LLM reply is immediately shown in the UI via a `ai_reply` Socket.IO event
+- The reply is simultaneously spoken aloud using **Deepgram Aura TTS** and streamed back as base64 MP3
+- **Interruption detection**: if the user speaks again before TTS is ready, the stale audio is silently dropped — no awkward overlapping speech
+
+### Live & Final Call Summaries
+
+- A lightweight summary is regenerated every 5 transcript segments so supervisors can monitor calls in progress
+- On call end, the heavy LLM produces a final structured summary covering: **Issue · Key Facts · Promises Made · Next Action**
+- Both live and final summaries are emitted over Socket.IO and persisted to the database
+
+### Action Item Extraction
+
+- On call end, a second LLM pass extracts every follow-up task as structured JSON
+- Each item includes: `text`, `priority` (high / medium / low), `assignee`, and `deadline_mentioned`
+- Items are stored in the database and displayed per call with priority colour-coding
+
+### Intent & Sentiment Classification
+
+- Classifies each transcript by intent: `inquiry | complaint | order | support | other`
+- Returns sentiment: `positive | neutral | negative` with a confidence score between 0 and 1
+
+### Language Detection
+
+- Detects the primary language of any transcript as `hi` · `en` · `hi-en`
+- Used to tag calls and drive display formatting
+
+### Document Intelligence (RAG)
+
+- Upload **PDF, DOCX, or TXT** files up to 200 MB
+- Documents are chunked (1 000 chars, 100-char overlap) and embedded into **ChromaDB**
+- Ingestion runs as an **RQ background job** (falls back to an inline thread if Redis is unavailable)
+- Real-time ingestion progress is pushed to the browser over Socket.IO via a Redis pub/sub bridge
+- Ask plain-English questions against any subset of documents; the RAG engine retrieves the most relevant chunks, builds a grounded context, and calls the LLM — answers cite source documents
+- Query results are cached in Redis for 10 minutes
+
+### Analytics Dashboard
+
+- Aggregate stats: total calls, average handle time, escalation rate, calls per day
+- Per-agent breakdown: call count, average duration, sentiment distribution
+- Date-range filtering on all analytics endpoints
+- Recharts visualisations for call volume trends
+
+### Authentication & Access Control
+
+- **JWT-based auth** with short-lived access tokens and long-lived refresh tokens
+- Token blacklisting via Redis (`jti` key stored on logout)
+- Role-based access: `agent · supervisor · admin`
+- Socket.IO connections validate the JWT at connect time — unauthenticated connections are rejected
+
+### Rate Limiting & Observability
+
+- Redis-backed rate limiter: 200 req/min, 20 req/sec per IP (falls back to in-memory if Redis is down)
+- **structlog** structured JSON logging (pretty-printed in development mode)
+- Per-request duration logged with method, path, status code, and user ID
+- `/health` endpoint reports Flask and Redis status
 
 ---
 
@@ -77,63 +116,181 @@ Browser (React 18 + Vite + Tailwind)
 
 | Layer | Technology |
 |---|---|
-| Frontend | React 18, Vite, Tailwind CSS 3, Recharts, Socket.IO client |
-| Fonts | Outfit (body), Bebas Neue (stats), Fira Code (mono) |
-| Backend | Flask 3, Flask-SocketIO (gevent), Flask-Limiter |
-| Auth | PyJWT, bcrypt |
-| Database | Supabase (PostgreSQL via SQLAlchemy + NullPool) |
-| Job Queue | Redis, RQ (python-rq) |
-| Vector Store | ChromaDB (local) |
-| STT | Deepgram Nova-2 (WebSocket streaming, hi-en) |
-| TTS | Deepgram Aura (REST) |
-| LLM | OpenRouter → claude-sonnet-4-5 / claude-haiku-4-5 |
-| Embeddings | OpenRouter → openai/text-embedding-3-small |
+| **Speech-to-Text** | Deepgram Nova-2 — WebSocket streaming, `hi-en` language model |
+| **Text-to-Speech** | Deepgram Aura — REST synthesis, base64 MP3 |
+| **LLM — heavy tasks** | OpenRouter (summaries, action items, RAG answers) |
+| **LLM — realtime** | OpenRouter (live conversational replies, ≤8 s timeout) |
+| **Embeddings** | OpenRouter embedding model (configurable) |
+| **Backend** | Python 3.12 · Flask 3 · Flask-SocketIO · SQLAlchemy 2 |
+| **Database** | Supabase (PostgreSQL) |
+| **Vector Store** | ChromaDB 0.5 — persistent local filesystem |
+| **Job Queue** | Redis + RQ |
+| **Frontend** | React 18 · Vite 5 · Tailwind CSS 3 · Recharts · socket.io-client 4 |
+| **Auth** | PyJWT + bcrypt |
+
+---
+
+## Architecture
+
+```
+Browser (React + Vite)
+  │
+  ├── REST (axios)        ──►  Flask Blueprints
+  │                              ├── /api/auth         JWT login / refresh / logout
+  │                              ├── /api/calls        Session CRUD + summaries
+  │                              ├── /api/documents    Upload + RAG search
+  │                              ├── /api/analytics    Aggregate + per-agent stats
+  │                              └── /api/jobs         RQ job status
+  │
+  └── Socket.IO           ──►  Flask-SocketIO
+        │                        ├── join_call   → opens Deepgram WebSocket
+        │                        ├── audio_chunk → forwards PCM to Deepgram
+        │                        └── leave_call  → closes WS, triggers LLM pipeline
+        │
+        ◄── transcript_interim / transcript_final
+        ◄── ai_reply / tts_audio
+        ◄── call_summary / action_items
+        ◄── doc_progress
+
+Pipeline (background threads)
+  ├── DeepgramSTTClient       WebSocket → transcript callbacks
+  ├── DeepgramTTSClient       REST → MP3 bytes
+  ├── OpenRouterLLMClient     chat completions (retry + exponential backoff)
+  ├── RAGEngine               ChromaDB retrieval + LLM grounded answer
+  └── DocumentProcessor       chunk + embed + store  (RQ job)
+
+Data
+  ├── Supabase (PostgreSQL)   calls · transcripts · summaries · action_items
+  │                           documents · document_chunks · users · jobs
+  ├── ChromaDB                document chunk embeddings
+  └── Redis                   rate limits · JWT blacklist · RQ queues · pub/sub
+```
+
+### LLM Model Routing
+
+Heavy tasks (summarise, extract action items, RAG answers) go to `OPENROUTER_HEAVY_MODEL`.  
+Light / realtime tasks (conversation replies, language detection, intent) go to `OPENROUTER_LIGHT_MODEL`.  
+Both are fully configurable via environment variables — swap to any model on OpenRouter with no code changes.
+
+---
+
+## API Reference
+
+All endpoints except `/health` and `/api/auth/login` require `Authorization: Bearer <access_token>`.
+
+### Authentication
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/auth/login` | Login with `username` + `password` → `access_token`, `refresh_token`, `role` |
+| `POST` | `/api/auth/refresh` | Exchange `refresh_token` → new `access_token` |
+| `POST` | `/api/auth/logout` | Blacklist the current `jti` in Redis |
+| `GET` | `/api/auth/me` | Current authenticated user info |
+| `GET` | `/api/auth/users` | List all users *(admin only)* |
+| `POST` | `/api/auth/users` | Create user *(admin only)* — `{username, password, role}` |
+
+### Calls
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/calls/start` | Create a call session → `{session_id, call_id, status}` |
+| `POST` | `/api/calls/:session_id/end` | End a call; triggers async summary generation |
+| `GET` | `/api/calls` | Paginated list — query params: `agent_id`, `status`, `from`, `to`, `page`, `per_page` |
+| `GET` | `/api/calls/:session_id` | Full detail: transcripts + summary + action items |
+
+### Documents
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/documents/upload` | Multipart upload (PDF, DOCX, TXT) — fields: `file`, `call_session_id?`, `description?` |
+| `GET` | `/api/documents` | Paginated document list |
+| `GET` | `/api/documents/:doc_id` | Document record |
+| `GET` | `/api/documents/:doc_id/status` | Ingestion status + RQ job status |
+| `POST` | `/api/documents/search` | RAG semantic search — `{query, doc_ids?, top_k?}` → `{answer, sources, cached}` |
+
+### Analytics
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/analytics/summary` | Aggregate stats — query params: `from`, `to` |
+| `GET` | `/api/analytics/agent/:agent_id` | Per-agent call statistics |
+
+### Health
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | `{status, version, redis: bool}` |
+
+---
+
+## Socket.IO Events
+
+The Socket.IO client must pass a JWT at connection time:
+
+```js
+io(WS_URL, { auth: { token: localStorage.getItem('pravaah_access_token') } })
+```
+
+### Client → Server
+
+| Event | Payload | Description |
+|---|---|---|
+| `join_call` | `{session_id}` | Open a Deepgram STT WebSocket for the session |
+| `audio_chunk` | `{session_id, data: base64}` | Forward a raw PCM audio chunk |
+| `leave_call` | `{session_id}` | Close STT; trigger final summary + action items |
+| `subscribe_doc_progress` | `{doc_id}` | Subscribe to document ingestion progress events |
+
+### Server → Client
+
+| Event | Payload | Description |
+|---|---|---|
+| `transcript_interim` | `{session_id, text, timestamp}` | Live partial transcript (not persisted) |
+| `transcript_final` | `{session_id, text, timestamp}` | Persisted final transcript segment |
+| `ai_reply` | `{session_id, text}` | LLM text reply (always emitted before TTS check) |
+| `tts_audio` | `{session_id, audio: base64 MP3}` | Synthesised voice reply |
+| `call_summary` | `{session_id, summary}` | Live (every 5 segments) or final summary |
+| `action_items` | `{session_id, items: [{text, priority, assignee}]}` | Extracted action items |
+| `doc_progress` | `{doc_id, status, ...}` | Real-time ingestion progress via Redis pub/sub |
+| `error` | `{session_id, code, message}` | Pipeline error |
 
 ---
 
 ## Prerequisites
 
-| Tool | Min version | Install |
+| Requirement | Version | Notes |
 |---|---|---|
-| Python | 3.10+ | https://www.python.org/downloads/ |
-| Node.js | 18+ | https://nodejs.org/ |
-| Redis | any | macOS: `brew install redis` · Ubuntu: `sudo apt-get install redis-server` |
-| Supabase account | — | https://supabase.com (free tier is sufficient) |
-
-**API keys required:**
-
-| Service | Where to get | Free tier |
-|---|---|---|
-| Deepgram | https://console.deepgram.com/ | 200 min/month |
-| OpenRouter | https://openrouter.ai/keys | Yes |
-| Supabase | https://supabase.com | 500 MB DB, unlimited auth |
+| Python | 3.11 + | Tested on 3.12 |
+| Node.js | 18 + | For the Vite dev server |
+| Redis | 7 + | `brew install redis` on macOS |
+| Deepgram account | — | Free tier: 200 min/month |
+| OpenRouter account | — | Free tier available |
+| Supabase project | — | Free tier available |
 
 ---
 
-## Setup
+## Setup & Installation
 
-### 1. Clone
+### 1. Clone the repository
 
 ```bash
-git clone https://github.com/ompatil19/pravaah-os.git
+git clone https://github.com/your-username/pravaah-os.git
 cd pravaah-os
 ```
 
-### 2. Create Supabase project
+### 2. Configure environment variables
 
-1. Go to [supabase.com](https://supabase.com) → **New project**
-2. Note your **Project ref**, **Region**, and **Database password**
-3. Open **Project Settings → API** and copy:
-   - `Project URL` → `SUPABASE_URL`
-   - `anon / public` key → `SUPABASE_ANON_KEY`
-   - `service_role` key → `SUPABASE_SERVICE_ROLE_KEY`
-4. Open **Project Settings → Database → Connection string → URI** (use the **Pooler / Transaction** URI on port `6543`) → `DATABASE_URL`
+```bash
+cp .env.example .env
+```
 
-### 3. Create tables in Supabase SQL Editor
+Open `.env` and fill in every required value. Full reference in the [Environment Variables](#environment-variables) section below.
 
-Go to **SQL Editor → New query**, paste and run:
+### 3. Create tables in Supabase
+
+Go to **Supabase dashboard → SQL Editor → New query**, paste and run the following:
 
 ```sql
+-- Users
 CREATE TABLE IF NOT EXISTS users (
     id            SERIAL PRIMARY KEY,
     username      TEXT UNIQUE NOT NULL,
@@ -144,6 +301,7 @@ CREATE TABLE IF NOT EXISTS users (
     is_active     BOOLEAN DEFAULT TRUE
 );
 
+-- Jobs (RQ task tracking)
 CREATE TABLE IF NOT EXISTS jobs (
     id           SERIAL PRIMARY KEY,
     job_id       TEXT UNIQUE NOT NULL,
@@ -156,6 +314,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     completed_at TIMESTAMPTZ
 );
 
+-- Calls
 CREATE TABLE IF NOT EXISTS calls (
     id               SERIAL PRIMARY KEY,
     session_id       TEXT UNIQUE NOT NULL,
@@ -168,6 +327,7 @@ CREATE TABLE IF NOT EXISTS calls (
     duration_seconds INTEGER
 );
 
+-- Transcripts
 CREATE TABLE IF NOT EXISTS transcripts (
     id         SERIAL PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES calls(session_id) ON DELETE CASCADE,
@@ -177,6 +337,7 @@ CREATE TABLE IF NOT EXISTS transcripts (
     timestamp  TEXT NOT NULL
 );
 
+-- Summaries
 CREATE TABLE IF NOT EXISTS summaries (
     id           SERIAL PRIMARY KEY,
     session_id   TEXT UNIQUE NOT NULL REFERENCES calls(session_id) ON DELETE CASCADE,
@@ -185,6 +346,7 @@ CREATE TABLE IF NOT EXISTS summaries (
     generated_at TEXT NOT NULL
 );
 
+-- Action items
 CREATE TABLE IF NOT EXISTS action_items (
     id         SERIAL PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES calls(session_id) ON DELETE CASCADE,
@@ -195,6 +357,7 @@ CREATE TABLE IF NOT EXISTS action_items (
     created_at TEXT NOT NULL
 );
 
+-- Documents
 CREATE TABLE IF NOT EXISTS documents (
     id           SERIAL PRIMARY KEY,
     doc_id       TEXT UNIQUE NOT NULL,
@@ -211,6 +374,7 @@ CREATE TABLE IF NOT EXISTS documents (
     status       TEXT DEFAULT 'uploading'
 );
 
+-- Document chunks (for RAG)
 CREATE TABLE IF NOT EXISTS document_chunks (
     id              SERIAL PRIMARY KEY,
     doc_id          TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
@@ -222,15 +386,15 @@ CREATE TABLE IF NOT EXISTS document_chunks (
 );
 
 -- Indexes
-CREATE INDEX IF NOT EXISTS idx_transcripts_session   ON transcripts(session_id);
-CREATE INDEX IF NOT EXISTS idx_action_items_session  ON action_items(session_id);
-CREATE INDEX IF NOT EXISTS idx_documents_session     ON documents(session_id);
-CREATE INDEX IF NOT EXISTS idx_document_chunks_doc   ON document_chunks(doc_id);
-CREATE INDEX IF NOT EXISTS idx_calls_agent           ON calls(agent_id);
-CREATE INDEX IF NOT EXISTS idx_calls_status          ON calls(status);
+CREATE INDEX IF NOT EXISTS idx_transcripts_session  ON transcripts(session_id);
+CREATE INDEX IF NOT EXISTS idx_action_items_session ON action_items(session_id);
+CREATE INDEX IF NOT EXISTS idx_documents_session    ON documents(session_id);
+CREATE INDEX IF NOT EXISTS idx_document_chunks_doc  ON document_chunks(doc_id);
+CREATE INDEX IF NOT EXISTS idx_calls_agent          ON calls(agent_id);
+CREATE INDEX IF NOT EXISTS idx_calls_status         ON calls(status);
 ```
 
-Then disable Row Level Security (we use our own JWT auth):
+Then disable Supabase Row Level Security (the app uses its own JWT auth):
 
 ```sql
 ALTER TABLE users           DISABLE ROW LEVEL SECURITY;
@@ -243,228 +407,261 @@ ALTER TABLE documents       DISABLE ROW LEVEL SECURITY;
 ALTER TABLE document_chunks DISABLE ROW LEVEL SECURITY;
 ```
 
-### 4. Configure environment
+### 4. Set up the Python backend
 
 ```bash
-cp .env.example .env
+python3 -m venv .venv
+source .venv/bin/activate        # macOS / Linux
+# .venv\Scripts\activate         # Windows
+
+pip install -r backend/requirements.txt
 ```
 
-Open `.env` and fill in:
+### 5. Set up the React frontend
+
+```bash
+cd frontend && npm install && cd ..
+```
+
+### 6. Start Redis
+
+```bash
+# macOS (Homebrew)
+brew services start redis
+
+# or directly
+redis-server
+```
+
+Verify: `redis-cli ping` should return `PONG`.
+
+### 7. (Optional) Start the RQ worker
+
+The backend falls back to an inline thread if Redis is unavailable, but a dedicated worker is recommended for production and large PDFs.
+
+```bash
+source .venv/bin/activate
+rq worker pravaah --url redis://localhost:6379/0
+```
+
+---
+
+## Environment Variables
+
+Copy `.env.example` → `.env` and fill in every value.
 
 ```env
-# Required
-DEEPGRAM_API_KEY=...
-OPENROUTER_API_KEY=...
-FLASK_SECRET_KEY=...       # python -c "import secrets; print(secrets.token_hex(32))"
-JWT_SECRET_KEY=...         # python -c "import secrets; print(secrets.token_hex(32))"
+# ── Deepgram ─────────────────────────────────────────────────────
+DEEPGRAM_API_KEY=           # console.deepgram.com → API Keys (free: 200 min/month)
 
-# Supabase
-SUPABASE_URL=https://xxxx.supabase.co
+# ── OpenRouter ───────────────────────────────────────────────────
+OPENROUTER_API_KEY=         # openrouter.ai/keys (free tier available)
+OPENROUTER_HEAVY_MODEL=meta-llama/llama-3.3-70b-instruct:free
+OPENROUTER_LIGHT_MODEL=meta-llama/llama-3.1-8b-instruct:free
+EMBEDDING_MODEL=nvidia/llama-nemotron-embed-vl-1b-v2:free
+
+# ── Flask ────────────────────────────────────────────────────────
+FLASK_SECRET_KEY=           # python -c "import secrets; print(secrets.token_hex(32))"
+FLASK_ENV=development
+FLASK_HOST=0.0.0.0
+FLASK_PORT=8000
+
+# ── Supabase ─────────────────────────────────────────────────────
+# Project Settings → API
+SUPABASE_URL=https://xxxxxxxxxxxx.supabase.co
 SUPABASE_ANON_KEY=eyJ...
 SUPABASE_SERVICE_ROLE_KEY=eyJ...
-DATABASE_URL=postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres
+# Project Settings → Database → Connection string → Session mode URI (port 5432)
+DATABASE_URL=postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:5432/postgres
+
+# ── Redis ────────────────────────────────────────────────────────
+REDIS_URL=redis://localhost:6379/0
+
+# ── ChromaDB ─────────────────────────────────────────────────────
+CHROMA_PATH=./chroma_store
+
+# ── Auth ─────────────────────────────────────────────────────────
+JWT_SECRET_KEY=             # python -c "import secrets; print(secrets.token_hex(32))"
+ADMIN_TOKEN=                # any strong password — protects /admin/rq
+
+# ── File Upload ──────────────────────────────────────────────────
+UPLOAD_FOLDER=./uploads
+MAX_UPLOAD_MB=200
+
+# ── Frontend ─────────────────────────────────────────────────────
+VITE_API_URL=http://localhost:8000
+VITE_WS_URL=http://localhost:8000
+
+# ── Logging ──────────────────────────────────────────────────────
+LOG_LEVEL=INFO
 ```
 
-### 5. Install dependencies & start
+### Where to get each key
+
+**Deepgram** — [console.deepgram.com](https://console.deepgram.com) → API Keys → Create a New API Key
+
+**OpenRouter** — [openrouter.ai/keys](https://openrouter.ai/keys) → Create Key. The default models are free; swap them for any model (Claude, GPT-4o, Gemini) by changing `OPENROUTER_HEAVY_MODEL` / `OPENROUTER_LIGHT_MODEL`.
+
+**Supabase**
+1. Create a project at [supabase.com](https://supabase.com)
+2. **Project Settings → API** → copy `URL`, `anon key`, and `service_role key`
+3. **Project Settings → Database → Connection string** → select **Session mode** (port **5432**) and copy the URI into `DATABASE_URL`
+
+---
+
+## Running the App
+
+Open **two terminal windows**.
+
+### Terminal 1 — Backend
 
 ```bash
-make setup   # creates .venv, installs Python + Node deps
-./start.sh   # starts Redis + RQ worker + Flask (5000) + Vite (5173)
+source .venv/bin/activate
+python -m backend.app
 ```
 
-Or run each manually:
+Flask starts at `http://localhost:8000`.
+
+### Terminal 2 — Frontend
 
 ```bash
-redis-server --daemonize yes
-.venv/bin/rq worker pravaah &
-.venv/bin/python -m backend.app &
-cd frontend && npm run dev
+cd frontend
+npm run dev
 ```
 
-### 6. Open
+Vite starts at `http://localhost:5173`.
 
-| Service | URL |
-|---|---|
-| Frontend | http://localhost:5173 |
-| Backend API | http://localhost:8000 |
-| Health check | http://localhost:8000/health |
-| Job dashboard | http://localhost:8000/admin/rq |
+Open **http://localhost:5173** in your browser.
 
-> Vite proxies `/api` and `/socket.io` requests to Flask on port 8000, so the frontend talks to the backend without any CORS issues in dev.
-
----
-
-## API Reference
-
-### Auth
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/auth/login` | Login, returns `access_token` + `refresh_token` |
-| `POST` | `/api/auth/refresh` | Refresh access token |
-| `POST` | `/api/auth/logout` | Blacklist token |
-| `GET` | `/api/auth/me` | Current user profile |
-| `POST` | `/api/auth/users` | Create user (admin only) |
-
-### Calls
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/calls` | Start a new call session |
-| `GET` | `/api/calls` | List calls (paginated, filterable) |
-| `GET` | `/api/calls/:sessionId` | Get call detail with transcripts + summary + action items |
-| `PATCH` | `/api/calls/:sessionId/end` | End a call |
-
-### Documents
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/documents/upload` | Upload PDF/DOCX/TXT (multipart/form-data) |
-| `GET` | `/api/documents` | List documents |
-| `GET` | `/api/documents/:docId` | Get document metadata |
-| `GET` | `/api/documents/:docId/status` | Embedding progress |
-| `POST` | `/api/documents/search` | RAG semantic search |
-| `DELETE` | `/api/documents/:docId` | Delete document + chunks |
-
-### Analytics
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/analytics/summary` | Aggregate KPIs (total calls, duration, language breakdown) |
-| `GET` | `/api/analytics/agent/:agentId` | Per-agent stats |
-| `GET` | `/api/analytics/timeline` | Call volume by day |
-
-### Jobs
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/jobs` | List background jobs |
-| `GET` | `/api/jobs/:jobId` | Job status + result |
-
-### Socket.IO Events
-
-| Direction | Event | Payload |
-|---|---|---|
-| Client → Server | `audio_chunk` | `{ session_id, chunk: ArrayBuffer }` |
-| Client → Server | `start_call` | `{ session_id, agent_id, language }` |
-| Client → Server | `end_call` | `{ session_id }` |
-| Server → Client | `transcript_partial` | `{ session_id, text, speaker }` |
-| Server → Client | `transcript_final` | `{ session_id, text, speaker, timestamp }` |
-| Server → Client | `doc_progress` | `{ doc_id, status, progress, total_pages, total_chunks }` |
-| Server → Client | `call_summary` | `{ session_id, summary, action_items }` |
+> **Default admin credentials** — on first startup `init_db()` creates an admin account:
+> - Username: `admin`
+> - Password: `admin123`
+>
+> Change these immediately via `POST /api/auth/users` (admin only) or directly in Supabase.
 
 ---
 
-## Document Ingestion (RAG)
-
-1. Upload via `POST /api/documents/upload` with `file` + optional `call_session_id`
-2. Server saves file, enqueues `ingest_document` job on the `pravaah` Redis queue
-3. RQ worker extracts text (pdfminer for PDFs, python-docx for DOCX), chunks it, embeds each chunk via OpenRouter, stores vectors in ChromaDB
-4. Progress is emitted as `doc_progress` Socket.IO events: `QUEUED → EXTRACTING → EMBEDDING (0–100%) → DONE`
-5. Query via `POST /api/documents/search` with `{ "query": "your question" }`
-
----
-
-## Folder Structure
+## Project Structure
 
 ```
 pravaah-os/
-├── .env.example            environment variable template
-├── ARCHITECTURE.md         system design document
-├── Makefile                setup / dev / test / clean targets
-├── README.md               this file
-├── start.sh                one-command launcher
 │
-├── backend/                Flask REST API + Socket.IO server
-│   ├── app.py              application factory + SocketIO init
-│   ├── auth.py             JWT helpers, token blacklist (Redis)
-│   ├── config.py           typed env var constants
-│   ├── database.py         SQLAlchemy engine + all DB helper functions
-│   ├── models.py           ORM models + legacy dict serializers
-│   ├── socket_handlers.py  Socket.IO event handlers (STT bridge)
-│   ├── utils.py            pagination, validation
-│   ├── requirements.txt    Python dependencies
+├── .env.example                  Template for all environment variables
+├── .env                          Your local secrets — never commit this
+│
+├── backend/                      Flask application
+│   ├── app.py                    Application factory, SocketIO init, Redis pub/sub listener
+│   ├── auth.py                   JWT generation, validation, blacklisting, bcrypt
+│   ├── config.py                 Centralised env-var loading
+│   ├── database.py               SQLAlchemy session + all query helpers
+│   ├── models.py                 ORM models: Call, Transcript, Summary, ActionItem, Document, User
+│   ├── socket_handlers.py        All Socket.IO handlers + LLM/TTS pipeline dispatch
+│   ├── utils.py                  Response helpers, pagination, file utilities
+│   ├── requirements.txt          Python dependencies
 │   └── routes/
-│       ├── auth.py         /api/auth/*
-│       ├── calls.py        /api/calls/*
-│       ├── documents.py    /api/documents/*
-│       ├── jobs.py         /api/jobs/*
-│       └── analytics.py    /api/analytics/*
+│       ├── auth.py               /api/auth — login, refresh, logout, user management
+│       ├── calls.py              /api/calls — start, end, list, detail
+│       ├── documents.py          /api/documents — upload, status, RAG search
+│       ├── analytics.py          /api/analytics — summary, per-agent stats
+│       └── jobs.py               /api/jobs — RQ job status
 │
-├── pipeline/               STT / TTS / LLM clients
-│   ├── deepgram_stt.py     Nova-2 WebSocket streaming client
-│   ├── deepgram_tts.py     Aura REST TTS client
-│   ├── openrouter_client.py LLM + embedding HTTP client
-│   ├── prompt_templates.py  system/user prompts
-│   └── session_manager.py  per-call state tracker
+├── pipeline/                     AI/ML processing layer
+│   ├── session_manager.py        Per-call STT session lifecycle
+│   ├── deepgram_stt.py           Deepgram WebSocket STT client
+│   ├── deepgram_tts.py           Deepgram Aura REST TTS client
+│   ├── openrouter_client.py      OpenRouter LLM client (retry, backoff, model routing)
+│   ├── rag_engine.py             ChromaDB retrieval + LLM answer generation + Redis cache
+│   ├── embeddings.py             Embedding client (configurable model via OpenRouter)
+│   ├── document_processor.py     PDF/DOCX/TXT chunking + ChromaDB ingestion (RQ job)
+│   ├── prompt_templates.py       All system and user prompt constants
+│   └── websocket_bridge.py       Low-level Deepgram WebSocket management
 │
-├── frontend/               React 18 + Vite + Tailwind
-│   ├── index.html
-│   ├── vite.config.js
-│   ├── tailwind.config.js
-│   └── src/
-│       ├── App.jsx         router + auth context + sidebar
-│       ├── api.js          axios helpers with JWT interceptor
-│       ├── socket.js       Socket.IO singleton
-│       ├── index.css       design system (CSS variables, animations)
-│       ├── pages/
-│       │   ├── Login.jsx
-│       │   ├── Dashboard.jsx
-│       │   ├── ActiveCall.jsx
-│       │   ├── CallDetail.jsx
-│       │   ├── Documents.jsx
-│       │   ├── Analytics.jsx
-│       │   └── AdminPage.jsx
-│       └── components/
-│           ├── WaveformVisualizer.jsx
-│           ├── TranscriptBubble.jsx
-│           ├── TranscriptDisplay.jsx
-│           ├── LiveSummaryPanel.jsx
-│           ├── ActionItemRow.jsx
-│           ├── ActionItemsList.jsx
-│           ├── CallSummaryCard.jsx
-│           ├── DocumentUploader.jsx
-│           ├── DocProgressBar.jsx
-│           ├── CallStatusBadge.jsx
-│           └── LanguageBadge.jsx
-│
-└── tests/
-    ├── test_api.py
-    ├── test_pipeline.py
-    └── test_socket.py
+└── frontend/                     React 18 + Vite + Tailwind CSS
+    └── src/
+        ├── main.jsx              React entry point, router setup
+        ├── App.jsx               Route definitions
+        ├── api.js                Axios client with JWT auth interceptor
+        ├── socket.js             Singleton Socket.IO client (lazy JWT)
+        ├── pages/
+        │   ├── Dashboard.jsx         Stat cards + active call list + new call modal
+        │   ├── ActiveCall.jsx        Live call — waveform, transcript, AI reply
+        │   ├── CallDetail.jsx        Full call view — transcript, summary, action items
+        │   ├── CallHistoryPage.jsx   Searchable paginated call log
+        │   ├── Documents.jsx         Drag-and-drop upload + status + RAG search
+        │   ├── Analytics.jsx         Recharts call volume and sentiment charts
+        │   ├── AdminPage.jsx         User management (admin only)
+        │   └── Login.jsx             JWT login form
+        └── components/
+            ├── AudioRecorder.jsx     Mic capture + audio chunk streaming via Socket.IO
+            ├── WaveformVisualizer.jsx  Animated real-time waveform using Web Audio API
+            ├── TranscriptDisplay.jsx   Scrolling interim/final transcript bubbles
+            ├── LiveSummaryPanel.jsx    Live summary sidebar (updates every 5 segments)
+            ├── ActionItemsList.jsx     Action items with priority colour badges
+            ├── DocumentUploader.jsx    Drag-and-drop file upload with mime validation
+            ├── DocProgressBar.jsx      Real-time ingestion progress driven by Socket.IO
+            ├── CallStatusBadge.jsx     Coloured status chips (active / ended)
+            ├── LanguageBadge.jsx       Language tag (hi / en / hi-en)
+            └── NavBar.jsx              Top navigation with role-aware links
 ```
 
 ---
 
-## Running Tests
+## Pages & UI
 
-```bash
-# All tests
-make test
+| Page | Route | What it shows |
+|---|---|---|
+| **Dashboard** | `/` | Stat cards (active calls, calls today, avg handle time, escalations), live call list, new call button |
+| **Live Call** | `/calls/:session_id` | Real-time waveform, interim + final transcript stream, AI text reply panel, live summary sidebar |
+| **Call Detail** | `/calls/:session_id/detail` | Full final transcript, structured summary card, prioritised action items list |
+| **Call History** | `/history` | Paginated, searchable log of all calls with status and language badges |
+| **Documents** | `/documents` | Drag-and-drop file upload, per-document ingestion progress bar, RAG search input |
+| **Analytics** | `/analytics` | Recharts bar and line charts for call volume, duration trends, sentiment distribution |
+| **Admin** | `/admin` | Create and manage users by role (agent / supervisor / admin) |
+| **Login** | `/login` | Username / password form; stores JWT in localStorage |
 
-# With coverage
-.venv/bin/pytest backend/tests/ tests/ --cov=backend --cov=pipeline --cov-report=term-missing
+---
 
-# Pipeline only
-make test-pipeline
-```
+## Key Design Decisions
 
-All tests use an isolated temporary SQLite database and mock all external HTTP/WebSocket calls — no real API keys required.
+**No voice framework**
+The pipeline is built from first principles — raw WebSocket to Deepgram, direct HTTP to OpenRouter — so there are no hidden abstractions between the audio stream and the LLM. This makes it straightforward to swap models, tune prompts, or add pipeline stages.
+
+**Threading instead of async**
+Flask-SocketIO runs in `threading` mode to stay compatible with the standard Werkzeug dev server without requiring monkey-patching. Every I/O-heavy task (STT callbacks, LLM calls, TTS synthesis, document ingestion) runs in daemon background threads so the main thread never blocks.
+
+**Interruption detection**
+Each session tracks a monotonically increasing generation counter. When the user speaks, the counter increments. Any in-flight LLM thread captures its generation at start; if the counter has moved by the time TTS audio is ready, the audio is silently dropped — no stale voice replies play over the user's next sentence.
+
+**RAG caching**
+Identical queries against the same document set are cached in Redis for 10 minutes using a SHA-256 hash of `(question, sorted_doc_ids, top_k)` as the key. This cuts repeated-query latency from ~2 s to under 10 ms.
+
+**LLM model routing**
+Two model tiers share a single client. Heavy tasks (summarise, extract action items, RAG) use `OPENROUTER_HEAVY_MODEL`; realtime conversational replies use `OPENROUTER_LIGHT_MODEL` with an 8-second hard timeout to prevent stale replies arriving after the call ends. Both are environment-variable-driven — no code change needed to swap models.
+
+**At-most-2 concurrent LLM threads per session**
+A per-session semaphore (`_MAX_CONCURRENT_LLM = 2`) prevents pile-up during bursty speech, where many final transcript events could otherwise queue dozens of LLM requests simultaneously.
 
 ---
 
 ## Troubleshooting
 
-**"DEEPGRAM_API_KEY not set" / no transcripts**
-Verify `.env` is populated and Flask loaded it: `curl http://localhost:8000/health`
+**No transcripts appearing**
+- Check `DEEPGRAM_API_KEY` is set: `curl http://localhost:8000/health`
+- Ensure the browser has microphone permission
+- Confirm `VITE_WS_URL=http://localhost:8000` is set
 
 **"Error connecting to Redis"**
-Start Redis: `redis-server --daemonize yes` or `brew services start redis`
-Verify: `redis-cli ping` → `PONG`
+```bash
+redis-server --daemonize yes   # start
+redis-cli ping                  # should return PONG
+```
 
 **Documents stuck in "processing"**
-Start the RQ worker: `make worker`
-Check: `redis-cli lrange rq:queues 0 -1`
+```bash
+# Start the RQ worker
+source .venv/bin/activate
+rq worker pravaah --url redis://localhost:6379/0
+```
 
 **ChromaDB permission error**
 ```bash
@@ -472,40 +669,14 @@ mkdir -p chroma_store && chmod 755 chroma_store
 ```
 
 **WebSocket CORS error in browser**
-- Confirm `VITE_WS_URL=http://localhost:8000` is set in `.env`
-- Vite's proxy (`frontend/vite.config.js`) must forward `/socket.io/*` to Flask
-- JWT must be passed in Socket.IO handshake auth
+- Confirm both `VITE_API_URL` and `VITE_WS_URL` point to `http://localhost:8000`
+- The Socket.IO client must pass the JWT in the `auth` object at connect time
 
-**Supabase: "SSL connection required" or prepared statement errors**
-Make sure `DATABASE_URL` uses the **Pooler URI** (port `6543`, Transaction mode), not the direct connection (port `5432`). The backend configures `NullPool` + `sslmode=require` automatically.
-
----
-
-## Environment Variables Reference
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `DEEPGRAM_API_KEY` | Yes | — | Deepgram STT + TTS |
-| `OPENROUTER_API_KEY` | Yes | — | LLM + embeddings |
-| `FLASK_SECRET_KEY` | Yes | dev-secret | Flask session signing |
-| `JWT_SECRET_KEY` | Yes | dev-jwt-secret | JWT signing |
-| `SUPABASE_URL` | Yes | — | Supabase project URL |
-| `SUPABASE_ANON_KEY` | Yes | — | Supabase anon key |
-| `SUPABASE_SERVICE_ROLE_KEY` | Yes | — | Supabase service role key |
-| `DATABASE_URL` | Yes | — | PostgreSQL connection URI (Supabase pooler) |
-| `REDIS_URL` | No | `redis://localhost:6379/0` | Redis connection |
-| `CHROMA_PATH` | No | `./chroma_store` | ChromaDB storage path |
-| `UPLOAD_FOLDER` | No | `./uploads` | File upload directory |
-| `MAX_UPLOAD_MB` | No | `200` | Max file size in MB |
-| `FLASK_PORT` | No | `8000` | Flask server port |
-| `LOG_LEVEL` | No | `INFO` | Logging level |
-| `OPENROUTER_HEAVY_MODEL` | No | `anthropic/claude-sonnet-4-5` | LLM for summaries |
-| `OPENROUTER_LIGHT_MODEL` | No | `anthropic/claude-haiku-4-5-20251001` | LLM for light tasks |
-| `EMBEDDING_MODEL` | No | `openai/text-embedding-3-small` | Embedding model |
-| `ADMIN_TOKEN` | No | — | Token to access /admin/rq |
+**Supabase SSL / prepared statement errors**
+Use the **Session mode** URI (port **5432**), not the Transaction pooler (port 6543). The backend configures `NullPool` and `sslmode=require` automatically.
 
 ---
 
 ## License
 
-MIT
+MIT — free to use, modify, and distribute.
